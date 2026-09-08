@@ -19,7 +19,9 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
-    "cmake>=3.30.4; sys_platform == 'linux'",
+    # >=4.0: the local cuVS checkout's installed CMake package config
+    # (backends/cuvs_local) requires CMake 4.0+ via cmake_minimum_required.
+    "cmake>=4.0; sys_platform == 'linux'",
     "libcuvs-cu12==26.2.0; sys_platform == 'linux'",
     "maturin>=1.4,<2; sys_platform == 'linux'",
     "pylance",

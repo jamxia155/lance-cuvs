@@ -54,6 +54,37 @@ export LANCE_CUVS_BACKEND=cu12
 
 Legacy overrides such as `cuvs-26-02` are still accepted for compatibility.
 
+A second backend, `cu12-local` (`backends/cuvs_local`), builds against a local
+cuVS checkout instead of a published cuVS release, for benchmarking against
+`cu12` head-to-head. It is never chosen by runtime auto-detection -- select it
+explicitly:
+
+```bash
+export LANCE_CUVS_BACKEND=cu12-local
+```
+
+`cu12-local` expects the local `cuvs` checkout (a sibling directory, e.g.
+`../cuvs` relative to `lance-cuvs`) to already be built and installed via its
+own `build.sh libcuvs`, with `INSTALL_PREFIX` set to a plain (non-conda)
+directory, e.g. (run from inside the `cuvs` checkout):
+
+```bash
+export INSTALL_PREFIX="$(pwd)/install"
+```
+
+`just backend-local-develop`/`backend-local-wheel`/`rust-local-check` default
+to that same path (`../cuvs/install`, relative to this repo) for
+`CMAKE_PREFIX_PATH` so `cuvs-sys`'s CMake `find_package(cuvs)` can locate it;
+override with `CUVS_LOCAL_INSTALL_PREFIX` if you installed elsewhere. In
+practice the built extension has loaded `libcuvs_c.so`/`libcuvs.so` from
+that prefix without any extra `LD_LIBRARY_PATH` -- the linker appears to
+bake in an RPATH back to the CMake install's `lib/` dir. If a future build
+*does* fail to find those shared libraries at import time (the loader's own
+shared-library preload only searches installed Python packages'
+site-packages, not an arbitrary CMake install prefix, so it won't help
+here), point `LD_LIBRARY_PATH` at `$INSTALL_PREFIX/lib` (`lib`, not `lib64`
+-- this build's install layout uses `lib`).
+
 ## Quick Start
 
 ```python
@@ -256,6 +287,12 @@ just gpu-smoke
   - CUDA / cuVS wrappers and tensor helpers
 - `backends/cuvs_26_02/src/python.rs`
   - PyO3 bindings
+- `backends/cuvs_local`
+  - Same shape as `cuvs_26_02`, but its `cuvs`/`cuvs-sys` dependencies point
+    at a local cuVS checkout (path dependency) instead of a published crate
+    version. Used to benchmark cuVS API/behavior changes (e.g. GDS/kvikio
+    integration) that don't exist in any released cuVS version yet, against
+    the `cuvs_26_02` baseline.
 
 ## License
 

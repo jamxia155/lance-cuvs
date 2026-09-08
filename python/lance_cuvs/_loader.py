@@ -38,6 +38,20 @@ SUPPORTED_BACKENDS: dict[str, BackendSpec] = {
         runtime_major=26,
         runtime_minor=2,
     ),
+    # Built against a local cuVS checkout (backends/cuvs_local) rather than a
+    # published cuVS release, for head-to-head benchmarking against `cu12`.
+    # Not reachable via runtime auto-detection (it shares `cu12`'s
+    # runtime_distribution, and `cu12` is matched first in
+    # `backend_key_for_runtime`) -- select it explicitly with
+    # `LANCE_CUVS_BACKEND=cu12-local`.
+    "cu12_local": BackendSpec(
+        key="cu12_local",
+        module="lance_cuvs_backend_cu12_local",
+        distribution="pylance-cuvs-cu12-local",
+        runtime_distribution="libcuvs-cu12",
+        runtime_major=26,
+        runtime_minor=2,
+    ),
 }
 
 _LEGACY_BACKEND_KEYS = {
