@@ -571,6 +571,35 @@ impl TransformSlot {
     }
 }
 
+// Tracks the first-observed and maximum value of a per-batch timing alongside
+// its running sum, to distinguish a one-time warm-up cost (first ~= max ~=
+// most of the sum, rest near-zero) from a cost that recurs on every batch
+// (first ~= max ~= sum / batch_count).
+#[derive(Default)]
+struct FirstMaxTracker {
+    first: Option<Duration>,
+    max: Duration,
+}
+
+impl FirstMaxTracker {
+    fn record(&mut self, value: Duration) {
+        if self.first.is_none() {
+            self.first = Some(value);
+        }
+        if value > self.max {
+            self.max = value;
+        }
+    }
+
+    fn first_secs(&self) -> f64 {
+        self.first.map(secs).unwrap_or(0.0)
+    }
+
+    fn max_secs(&self) -> f64 {
+        secs(self.max)
+    }
+}
+
 #[derive(Default)]
 struct ArtifactBuildStats {
     scanner_tasks: usize,
@@ -594,9 +623,15 @@ struct ArtifactBuildStats {
     gpu_h2d: Duration,
     gpu_transform: Duration,
     gpu_d2h: Duration,
+    gpu_h2d_first_max: FirstMaxTracker,
+    gpu_transform_first_max: FirstMaxTracker,
+    gpu_d2h_first_max: FirstMaxTracker,
     launch_h2d_enqueue: Duration,
     launch_transform_call: Duration,
     launch_d2h_enqueue: Duration,
+    launch_h2d_enqueue_first_max: FirstMaxTracker,
+    launch_transform_call_first_max: FirstMaxTracker,
+    launch_d2h_enqueue_first_max: FirstMaxTracker,
     drain_sync: Duration,
     drain_build_batch: Duration,
     register: Duration,
@@ -635,6 +670,9 @@ impl ArtifactBuildStats {
         self.gpu_h2d += drained.h2d;
         self.gpu_transform += drained.transform;
         self.gpu_d2h += drained.d2h;
+        self.gpu_h2d_first_max.record(drained.h2d);
+        self.gpu_transform_first_max.record(drained.transform);
+        self.gpu_d2h_first_max.record(drained.d2h);
         self.drain_sync += drained.sync;
         self.drain_build_batch += drained.build_batch;
     }
@@ -643,6 +681,9 @@ impl ArtifactBuildStats {
         self.launch_h2d_enqueue += timings.h2d_enqueue;
         self.launch_transform_call += timings.transform_call;
         self.launch_d2h_enqueue += timings.d2h_enqueue;
+        self.launch_h2d_enqueue_first_max.record(timings.h2d_enqueue);
+        self.launch_transform_call_first_max.record(timings.transform_call);
+        self.launch_d2h_enqueue_first_max.record(timings.d2h_enqueue);
     }
 
     fn log(&self) {
@@ -679,10 +720,30 @@ impl ArtifactBuildStats {
             secs(self.gpu_d2h),
         );
         eprintln!(
+            "cuVS artifact gpu events (first batch / max batch, to isolate one-time warm-up costs): \
+             h2d first_s={:.3} max_s={:.3} | transform first_s={:.3} max_s={:.3} | d2h first_s={:.3} max_s={:.3}",
+            self.gpu_h2d_first_max.first_secs(),
+            self.gpu_h2d_first_max.max_secs(),
+            self.gpu_transform_first_max.first_secs(),
+            self.gpu_transform_first_max.max_secs(),
+            self.gpu_d2h_first_max.first_secs(),
+            self.gpu_d2h_first_max.max_secs(),
+        );
+        eprintln!(
             "cuVS artifact launch cpu: h2d_enqueue_s={:.3} transform_call_s={:.3} d2h_enqueue_s={:.3}",
             secs(self.launch_h2d_enqueue),
             secs(self.launch_transform_call),
             secs(self.launch_d2h_enqueue),
+        );
+        eprintln!(
+            "cuVS artifact launch cpu (first batch / max batch, to isolate one-time warm-up costs): \
+             h2d_enqueue first_s={:.3} max_s={:.3} | transform_call first_s={:.3} max_s={:.3} | d2h_enqueue first_s={:.3} max_s={:.3}",
+            self.launch_h2d_enqueue_first_max.first_secs(),
+            self.launch_h2d_enqueue_first_max.max_secs(),
+            self.launch_transform_call_first_max.first_secs(),
+            self.launch_transform_call_first_max.max_secs(),
+            self.launch_d2h_enqueue_first_max.first_secs(),
+            self.launch_d2h_enqueue_first_max.max_secs(),
         );
         eprintln!(
             "cuVS artifact drain cpu: sync_s={:.3} build_batch_s={:.3}",
