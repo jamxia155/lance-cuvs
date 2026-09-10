@@ -34,9 +34,6 @@ pub(crate) type CudaMemcpyKind = c_uint;
 // `cudaMemcpyDefault` against them fails with `cudaErrorInvalidValue`.
 pub(crate) const CUDA_MEMCPY_HOST_TO_DEVICE: CudaMemcpyKind = 1;
 pub(crate) const CUDA_MEMCPY_DEVICE_TO_HOST: CudaMemcpyKind = 2;
-// cudaHostRegisterPortable: makes a cudaHostRegister() registration valid
-// across all CUDA contexts/threads, not just the one that performed it.
-pub(crate) const CUDA_HOST_REGISTER_PORTABLE: u32 = 0x01;
 
 #[link(name = "cudart")]
 unsafe extern "C" {
@@ -436,12 +433,18 @@ impl RegisteredHostBuffer {
         let ptr = inward_start as *mut c_void;
 
         check_cuda(
-            // `cudaHostRegisterPortable`: this registration happens on a
-            // tokio blocking-pool thread (`prepare_transform_batch`'s
-            // `spawn_blocking`), while the memory is later used for
-            // `cudaMemcpyAsync` from a different thread (the pipeline's
-            // main task, in `TransformSlot::launch`).
-            unsafe { cudaHostRegister(ptr, bytes, CUDA_HOST_REGISTER_PORTABLE) },
+            // Flags=0 (not Portable): tried Portable while debugging a
+            // cross-thread-registration theory for a cudaErrorInvalidValue
+            // that turned out to be caused by overlapping registered ranges
+            // instead (fixed above via inward page rounding), unrelated to
+            // Portable. Benchmarking then showed Portable adds a real,
+            // consistent per-batch cost (~70-100ms/batch on H2D, matching
+            // cuVS PR investigation notes: Portable memory is documented to
+            // participate across all CUDA contexts, a heavier guarantee
+            // this single-context pipeline doesn't need) with no
+            // correctness benefit -- matches cuvs_26_02's cuda.rs, which
+            // has always used flags=0 here without issue.
+            unsafe { cudaHostRegister(ptr, bytes, 0) },
             "register host buffer",
         )?;
         Ok(Self {
