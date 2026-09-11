@@ -18,8 +18,11 @@
 //! - each page's structural layout is `PageLayout::FullZipLayout` with `bits_rep == 0 &&
 //!   bits_def == 0` (non-nullable, not inside a list -- confirmed via encoder-side tracing to be
 //!   the case that writes zero control-word/repetition-index overhead, making the on-disk bytes
-//!   a plain contiguous float array) and `bits_per_value` matching the expected dtype width
-//!   (uncompressed)
+//!   a plain contiguous float array) and `bits_per_value` matching `dimension * dtype_width`
+//!   (uncompressed) -- `bits_per_value` is bits for one atomic FullZip "value", which for a
+//!   FixedSizeList<f32,dim> column is the whole dim-float row, not one scalar (empirically
+//!   confirmed via `gds_fragment_verify`: dim=2048 gave 65536, not 32 -- an earlier version of
+//!   this check asserted plain dtype width and failed loudly with exactly that number)
 //! - the target column is flat (not nested under a struct), so its position in
 //!   `file_schema.fields` matches its `ColumnInfo` index
 //!
@@ -93,10 +96,17 @@ fn resolve_page_full_zip(
             )));
         }
     };
+    // NOTE: `bits_per_value` here is bits for one *atomic FullZip "value"*, which for a
+    // FixedSizeList<f32, dim> column is the whole dim-float row, not a single scalar -- e.g.
+    // dim=2048 gives 2048*32=65536, not 32. Confirmed empirically via `gds_fragment_verify`
+    // against a real dataset (the first version of this check asserted plain 32 and failed
+    // loudly with exactly this number, which is what caught the bug) -- `expected_bits_per_value`
+    // must already be `dimension * bytes_per_value * 8`, computed by the caller.
     if bits_per_value != expected_bits_per_value {
         return Err(Error::not_supported(format!(
-            "expected {expected_bits_per_value} bits/value, got {bits_per_value} -- column may \
-             be compressed, which this GDS path does not support"
+            "expected {expected_bits_per_value} bits/value (dimension * bytes_per_value * 8), \
+             got {bits_per_value} -- column may be compressed, which this GDS path does not \
+             support"
         )));
     }
     // `value_compression` (a `CompressiveEncoding`) isn't explicitly asserted here to be
@@ -126,7 +136,10 @@ pub fn resolve_whole_column(
     expected_dimension: u64,
     expected_bytes_per_value: u64,
 ) -> Result<Vec<PagePlan>> {
-    let expected_bits_per_value = (expected_bytes_per_value * 8) as u32;
+    // `FullZipLayout.bits_per_value` is bits for one atomic FullZip "value" -- the whole
+    // dim-float row for a FixedSizeList<f32,dim> column, not one scalar -- see the note in
+    // `resolve_page_full_zip`.
+    let expected_bits_per_value = (expected_dimension * expected_bytes_per_value * 8) as u32;
     let stride = expected_dimension * expected_bytes_per_value;
     let mut out = Vec::with_capacity(column.page_infos.len());
     let mut row_cursor = 0u64;
