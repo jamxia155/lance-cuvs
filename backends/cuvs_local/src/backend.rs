@@ -17,7 +17,9 @@ use futures::lock::Mutex;
 use futures::{
     FutureExt, SinkExt, StreamExt, TryStreamExt, channel::mpsc, future::LocalBoxFuture, stream,
 };
+use crate::gds_layout::resolve_fragment_column;
 use lance::dataset::Dataset;
+use lance::dataset::fragment::FileFragment;
 use lance::index::vector::PartitionArtifactBuilder;
 use lance::index::vector::utils::infer_vector_dim;
 use lance_arrow::FixedSizeListArrayExt;
@@ -29,6 +31,7 @@ use log::warn;
 use ndarray::Array2;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -857,6 +860,55 @@ fn prepare_workers_from_env() -> usize {
         .unwrap_or(DEFAULT_PREPARE_WORKERS)
 }
 
+/// Opt-in switch for the GDS read path (`append_transformed_batches_via_gds`), off by default --
+/// `gds_layout.rs`'s narrow scope (non-nullable `FixedSizeList<f32>`, 2.1 `FullZipLayout` only,
+/// single data file per fragment, no deletion vector) means it can reject a dataset the normal
+/// CPU path handles fine, so this must stay opt-in until that scope is broadened.
+fn gds_read_enabled_from_env() -> bool {
+    std::env::var("LANCE_CUVS_GDS_READ").ok().as_deref() == Some("1")
+}
+
+/// The dataset's local filesystem root, needed because the GDS read path (`cuvsReadLargeFile`)
+/// does a raw file open, unlike `Dataset`'s own `ObjectStore` abstraction which also supports
+/// non-local backends a raw open can't reach. This GDS path only ever makes sense for local block
+/// storage regardless (that's the entire premise of GDS), so requiring this is a scope match, not
+/// a new limitation. `Dataset::uri()` echoes back whatever was passed to `Dataset::open`, which
+/// for a local dataset is a plain filesystem path (this doesn't handle a `file://`-prefixed URI
+/// differently -- not needed unless/until a caller is found that opens datasets that way).
+fn local_dataset_root(dataset: &Dataset) -> PathBuf {
+    PathBuf::from(dataset.uri())
+}
+
+/// Row IDs for one fragment's entire row range, in physical row order -- metadata-scale (an
+/// empty-projection scan, ~8 bytes/row for the `_rowid` column alone), not the bulk vector data
+/// the GDS path exists to avoid re-fetching through the normal decode path. Must be in the same
+/// physical order `gds_layout::resolve_fragment_column`'s pages are resolved in (page-encounter
+/// order, i.e. physical row order within the fragment) for the two to line up correctly --
+/// deliberately not passing `scan_in_order(false)` (which the normal CPU path uses for
+/// cross-fragment concurrency) for exactly this reason.
+async fn fragment_row_ids(dataset: &Dataset, fragment: &FileFragment) -> Result<ArrayRef> {
+    let mut scanner = dataset.scan();
+    scanner.with_fragments(vec![fragment.metadata().clone()]);
+    scanner.empty_project()?;
+    scanner.with_row_id();
+    let mut stream = scanner.try_into_stream().await?;
+
+    let mut parts: Vec<RecordBatch> = Vec::new();
+    while let Some(batch) = stream.try_next().await? {
+        parts.push(batch);
+    }
+    let Some(schema) = parts.first().map(RecordBatch::schema) else {
+        return Ok(Arc::new(arrow_array::UInt64Array::from(Vec::<u64>::new())));
+    };
+    let batch = concat_batches(&schema, &parts)?;
+    batch.column_by_name(ROW_ID).cloned().ok_or_else(|| {
+        Error::io(format!(
+            "fragment {} row-id scan is missing the {ROW_ID} column",
+            fragment.metadata().id
+        ))
+    })
+}
+
 fn scan_fragment_readahead_from_env() -> usize {
     std::env::var("LANCE_CUVS_SCAN_FRAGMENT_READAHEAD")
         .ok()
@@ -1249,6 +1301,158 @@ async fn append_transformed_batches_to_artifact(
     Ok(())
 }
 
+/// GDS counterpart to `append_transformed_batches_to_artifact`: reads straight from disk into
+/// device memory via `cuvsReadLargeFile` (`TransformSlot::launch_gds`), skipping the host
+/// scan/decode/matrix-packing pipeline entirely. Processes one whole fragment per slot-launch
+/// (not a `batch_size` chunk) -- `gds_layout::resolve_fragment_column` only resolves a fragment's
+/// entire row range, not arbitrary sub-ranges, so device buffers are sized to the largest
+/// fragment up front rather than a configurable batch size.
+///
+/// Narrower than the CPU path by design (see `gds_layout.rs`'s module docs): rejects
+/// `filter_nan=true` on a nullable column outright (real unsupported case, not silently ignored),
+/// and any fragment `resolve_fragment_column` itself rejects (deletion vector present, more than
+/// one data file, non-2.1/non-`FullZipLayout` encoding, nullable column) surfaces as a hard error
+/// for the whole build rather than a silent fallback -- this path is opt-in
+/// (`LANCE_CUVS_GDS_READ=1`) precisely because it doesn't yet cover every dataset shape the CPU
+/// path does.
+async fn append_transformed_batches_via_gds(
+    dataset: &Dataset,
+    column: &str,
+    trained: &TrainedIvfPqIndex,
+    filter_nan: bool,
+    append_tx: &mut mpsc::Sender<Result<RecordBatch>>,
+) -> Result<()> {
+    if filter_nan
+        && dataset
+            .schema()
+            .field(column)
+            .is_some_and(|field| field.nullable)
+    {
+        return Err(Error::not_supported(
+            "GDS read path (LANCE_CUVS_GDS_READ=1) does not support filter_nan=true on a \
+             nullable column -- disable filter_nan or use the normal CPU scan path instead",
+        ));
+    }
+
+    let dataset_root = local_dataset_root(dataset);
+    let fragments = dataset.get_fragments();
+    if fragments.is_empty() {
+        return Ok(());
+    }
+
+    let dimension = trained.dimension;
+    let code_width = trained.pq_code_width();
+    let cuda_stream = trained
+        .resources
+        .get_cuda_stream()
+        .map_err(|error| Error::io(error.to_string()))?;
+
+    let max_fragment_rows = fragments
+        .iter()
+        .map(|fragment| {
+            fragment.metadata().physical_rows.ok_or_else(|| {
+                Error::io(format!(
+                    "fragment {} is missing physical_rows metadata; GDS read path requires it",
+                    fragment.metadata().id
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+
+    let mut slots = (0..PIPELINE_SLOTS)
+        .map(|_| TransformSlot::try_new(&trained.resources, max_fragment_rows, dimension, code_width))
+        .collect::<Result<Vec<_>>>()?;
+    let mut next_slot = 0usize;
+    let mut stats = ArtifactBuildStats::default();
+
+    for fragment in fragments.iter() {
+        let (local_path, plans) =
+            resolve_fragment_column(dataset, &dataset_root, fragment, column, dimension as u64, 4)
+                .await?;
+        let rows: u64 = plans.iter().map(|plan| plan.num_rows).sum();
+        if rows == 0 {
+            continue;
+        }
+
+        let row_ids = fragment_row_ids(dataset, fragment).await?;
+        if row_ids.len() != rows as usize {
+            return Err(Error::io(format!(
+                "fragment {}: row-id count {} does not match GDS-resolved row count {rows}",
+                fragment.metadata().id,
+                row_ids.len()
+            )));
+        }
+
+        let path_str = local_path.to_str().ok_or_else(|| {
+            Error::io(format!(
+                "GDS data file path is not valid UTF-8: {}",
+                local_path.display()
+            ))
+        })?;
+        let reads: Vec<GdsRead> = plans
+            .iter()
+            .map(|plan| GdsRead {
+                path: path_str.to_string(),
+                file_offset: plan.file_offset,
+                dst_offset_bytes: (plan.row_start * dimension as u64 * 4) as usize,
+                len_bytes: plan.byte_len as usize,
+            })
+            .collect();
+
+        let slot = &mut slots[next_slot];
+        let drain_start = Instant::now();
+        let transformed = if let Some(transformed) = slot.drain_to_batch(code_width)? {
+            stats.drain += drain_start.elapsed();
+            stats.record_drained(&transformed);
+            Some(transformed)
+        } else {
+            stats.drain += drain_start.elapsed();
+            None
+        };
+
+        let launch_start = Instant::now();
+        let launch_timings =
+            slot.launch_gds(trained, cuda_stream, row_ids, rows as usize, dimension, &reads)?;
+        stats.launch += launch_start.elapsed();
+        stats.record_launch_timings(launch_timings);
+
+        if let Some(transformed) = transformed {
+            let send_start = Instant::now();
+            append_tx
+                .send(Ok(transformed.batch))
+                .await
+                .map_err(|error| {
+                    Error::io(format!("failed to forward transformed batch: {error}"))
+                })?;
+            stats.send += send_start.elapsed();
+        }
+        next_slot = (next_slot + 1) % PIPELINE_SLOTS;
+    }
+
+    for slot in &mut slots {
+        let drain_start = Instant::now();
+        if let Some(transformed) = slot.drain_to_batch(code_width)? {
+            stats.drain += drain_start.elapsed();
+            stats.record_drained(&transformed);
+            let send_start = Instant::now();
+            append_tx
+                .send(Ok(transformed.batch))
+                .await
+                .map_err(|error| {
+                    Error::io(format!("failed to forward transformed batch: {error}"))
+                })?;
+            stats.send += send_start.elapsed();
+        } else {
+            stats.drain += drain_start.elapsed();
+        }
+    }
+    stats.log();
+    Ok(())
+}
+
 async fn append_artifact_batches(
     mut artifact: PartitionArtifactBuilder,
     mut rx: mpsc::Receiver<Result<RecordBatch>>,
@@ -1485,16 +1689,23 @@ pub async fn assign_ivf_pq_to_artifact(
     let (mut append_tx, append_rx) = mpsc::channel::<Result<RecordBatch>>(PIPELINE_SLOTS);
     let append_task = tokio::spawn(append_artifact_batches(artifact, append_rx));
 
+    let use_gds = gds_read_enabled_from_env();
     let append_start = Instant::now();
-    let append_result = append_transformed_batches_to_artifact(
-        dataset,
-        column,
-        trained,
-        batch_size,
-        filter_nan,
-        &mut append_tx,
-    )
-    .await;
+    let append_result = if use_gds {
+        eprintln!("cuVS artifact build: LANCE_CUVS_GDS_READ=1, using the GDS read path");
+        append_transformed_batches_via_gds(dataset, column, trained, filter_nan, &mut append_tx)
+            .await
+    } else {
+        append_transformed_batches_to_artifact(
+            dataset,
+            column,
+            trained,
+            batch_size,
+            filter_nan,
+            &mut append_tx,
+        )
+        .await
+    };
     drop(append_tx);
     if let Err(error) = append_result {
         append_task.abort();
