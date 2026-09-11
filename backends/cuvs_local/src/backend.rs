@@ -2,10 +2,11 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::cuda::{
-    CudaEvent, CuvsIvfPqIndex, DeviceTensor, HostTensorView, MatrixBuffer, PinnedHostBuffer,
-    RegisteredHostBuffer, check_cuvs, copy_tensor_to_host_f32_2d, copy_tensor_to_host_f32_3d,
-    create_index_params, destroy_index_params, enable_rmm_pool_from_env, ivf_centroids_from_host,
-    make_tensor_view, matrix_from_vectors, pq_codebook_from_host,
+    CudaEvent, CuvsIvfPqIndex, DeviceTensor, GdsReadFuture, HostTensorView, MatrixBuffer,
+    PinnedHostBuffer, RegisteredHostBuffer, check_cuvs, copy_tensor_to_host_f32_2d,
+    copy_tensor_to_host_f32_3d, create_index_params, destroy_index_params,
+    enable_rmm_pool_from_env, finish_gds_read_async, ivf_centroids_from_host, make_tensor_view,
+    matrix_from_vectors, pq_codebook_from_host,
 };
 use arrow::compute::{concat_batches, filter};
 use arrow_array::cast::AsArray;
@@ -405,22 +406,6 @@ struct PreparedTransformBatch {
     input_registration: Option<RegisteredHostBuffer>,
 }
 
-/// One resolved, ready-to-issue GDS read: `len_bytes` starting at `file_offset` in `path`, landing
-/// at `dst_offset_bytes` within a `TransformSlot`'s `input_device` buffer.
-///
-/// A single batch typically needs more than one of these -- a fragment's row range can span
-/// several physical pages, each independently offset-resolved (see the byte-range-resolution
-/// design notes in `profiling/GDS_PORTING_PLAN.md`, "Fragment byte-range resolution research").
-/// Resolving `path`/`file_offset`/`dst_offset_bytes` from a fragment + row range is Lance-format
-/// knowledge that does not yet exist on this branch -- not yet implemented, tracked as an open
-/// item in that doc.
-struct GdsRead {
-    path: String,
-    file_offset: u64,
-    dst_offset_bytes: usize,
-    len_bytes: usize,
-}
-
 struct DrainedTransformBatch {
     batch: RecordBatch,
     h2d: Duration,
@@ -552,18 +537,23 @@ impl TransformSlot {
         Ok(timings)
     }
 
-    /// GDS counterpart to `launch()`: fills `input_device` via a sequence of `read_from_gds` calls
-    /// (already-resolved `reads`) instead of `copy_from_host_async` from a host-decoded matrix.
-    /// Everything downstream (transform call, D2H copy, event bracketing) is identical to `launch`
-    /// -- `drain_to_batch` doesn't need to know or care which path populated the slot.
-    fn launch_gds(
+    /// GDS counterpart to `launch()`, split in two -- this half only sets up shape/bookkeeping and
+    /// issues the transform + D2H copy; the caller is responsible for issuing this slot's
+    /// `input_device` reads (via `DeviceTensor::read_from_gds_async`) *before* calling this, on the
+    /// same `stream`. Splitting it this way (rather than reads-then-transform in one call, as the
+    /// earlier synchronous `launch_gds` did) is what makes read/compute overlap possible: since
+    /// reads and transform are both enqueued on one shared stream, enqueue order alone guarantees
+    /// correctness (the transform kernel won't start until the stream reaches it, i.e. after the
+    /// reads before it complete) without any host-side wait between them -- letting the caller
+    /// enqueue the *next* fragment's reads immediately after this call returns, while this
+    /// fragment's transform is still running on the GPU.
+    fn launch_gds_prefetched(
         &mut self,
         trained: &TrainedIvfPqIndex,
         stream: cuvs_sys::cudaStream_t,
         row_ids: Arc<dyn Array>,
         rows: usize,
         dimension: usize,
-        reads: &[GdsRead],
     ) -> Result<LaunchTimings> {
         let mut timings = LaunchTimings::default();
         let code_width = trained.pq_code_width();
@@ -576,19 +566,6 @@ impl TransformSlot {
         self.input_registration = None;
         self.input_vectors = None;
         self.input_matrix = None;
-
-        self.h2d_start.record(stream)?;
-        let h2d_enqueue_start = Instant::now();
-        for read in reads {
-            self.input_device.read_from_gds(
-                &read.path,
-                read.file_offset,
-                read.dst_offset_bytes,
-                read.len_bytes,
-            )?;
-        }
-        timings.h2d_enqueue += h2d_enqueue_start.elapsed();
-        self.h2d_done.record(stream)?;
 
         let transform_call_start = Instant::now();
         check_cuvs(
@@ -1302,11 +1279,14 @@ async fn append_transformed_batches_to_artifact(
 }
 
 /// GDS counterpart to `append_transformed_batches_to_artifact`: reads straight from disk into
-/// device memory via `cuvsReadLargeFile` (`TransformSlot::launch_gds`), skipping the host
-/// scan/decode/matrix-packing pipeline entirely. Processes one whole fragment per slot-launch
-/// (not a `batch_size` chunk) -- `gds_layout::resolve_fragment_column` only resolves a fragment's
-/// entire row range, not arbitrary sub-ranges, so device buffers are sized to the largest
-/// fragment up front rather than a configurable batch size.
+/// device memory via `cuvsReadLargeFileAsync` (`DeviceTensor::read_from_gds_async` +
+/// `TransformSlot::launch_gds_prefetched`), skipping the host scan/decode/matrix-packing pipeline
+/// entirely. Reads for the next fragment are issued right after the current fragment's transform
+/// is enqueued, overlapping disk I/O with GPU compute (see `launch_gds_prefetched`'s doc comment).
+/// Processes one whole fragment per slot-launch (not a `batch_size` chunk) --
+/// `gds_layout::resolve_fragment_column` only resolves a fragment's entire row range, not
+/// arbitrary sub-ranges, so device buffers are sized to the largest fragment up front rather than
+/// a configurable batch size.
 ///
 /// Narrower than the CPU path by design (see `gds_layout.rs`'s module docs): rejects
 /// `filter_nan=true` on a nullable column outright (real unsupported case, not silently ignored),
@@ -1366,6 +1346,16 @@ async fn append_transformed_batches_via_gds(
         .map(|_| TransformSlot::try_new(&trained.resources, max_fragment_rows, dimension, code_width))
         .collect::<Result<Vec<_>>>()?;
     let mut next_slot = 0usize;
+    // Reads issued for the fragment currently occupying each slot, finished only once that slot
+    // is next drained -- `drain_to_batch`'s own host-side event sync is exactly the point where
+    // we've confirmed (not just assumed) the stream has progressed past these reads, satisfying
+    // `finish_gds_read_async`'s contract, and it's also the point right before that slot's buffer
+    // gets reused for a new read two iterations later. See `launch_gds_prefetched`'s doc comment
+    // for why issuing reads for fragment i+1 here, right after fragment i's launch, achieves
+    // overlap: fragment i's transform is already enqueued on the GPU by this point, and issuing
+    // i+1's reads (into the *other* slot's physically distinct buffer) doesn't block on it.
+    let mut pending_reads: Vec<Option<Vec<(GdsReadFuture, usize)>>> =
+        (0..PIPELINE_SLOTS).map(|_| None).collect();
     let mut stats = ArtifactBuildStats::default();
 
     for fragment in fragments.iter() {
@@ -1392,15 +1382,6 @@ async fn append_transformed_batches_via_gds(
                 local_path.display()
             ))
         })?;
-        let reads: Vec<GdsRead> = plans
-            .iter()
-            .map(|plan| GdsRead {
-                path: path_str.to_string(),
-                file_offset: plan.file_offset,
-                dst_offset_bytes: (plan.row_start * dimension as u64 * 4) as usize,
-                len_bytes: plan.byte_len as usize,
-            })
-            .collect();
 
         let slot = &mut slots[next_slot];
         let drain_start = Instant::now();
@@ -1413,11 +1394,40 @@ async fn append_transformed_batches_via_gds(
             None
         };
 
+        // This slot's buffer is about to be reused for a new read below -- finish (and release)
+        // whatever reads previously filled it now that drain (or, on this slot's first use,
+        // nothing) has confirmed the stream is past them.
+        if let Some(prior_reads) = pending_reads[next_slot].take() {
+            for (future, expected_bytes) in prior_reads {
+                finish_gds_read_async(future, expected_bytes)?;
+            }
+        }
+
         let launch_start = Instant::now();
-        let launch_timings =
-            slot.launch_gds(trained, cuda_stream, row_ids, rows as usize, dimension, &reads)?;
+        slot.h2d_start.record(cuda_stream)?;
+        let h2d_enqueue_start = Instant::now();
+        let mut issued_reads = Vec::with_capacity(plans.len());
+        for plan in &plans {
+            let dst_offset_bytes = (plan.row_start * dimension as u64 * 4) as usize;
+            let future = slot.input_device.read_from_gds_async(
+                path_str,
+                plan.file_offset,
+                dst_offset_bytes,
+                plan.byte_len as usize,
+                cuda_stream,
+            )?;
+            issued_reads.push((future, plan.byte_len as usize));
+        }
+        let h2d_enqueue_elapsed = h2d_enqueue_start.elapsed();
+        slot.h2d_done.record(cuda_stream)?;
+
+        let mut launch_timings =
+            slot.launch_gds_prefetched(trained, cuda_stream, row_ids, rows as usize, dimension)?;
+        launch_timings.h2d_enqueue += h2d_enqueue_elapsed;
         stats.launch += launch_start.elapsed();
         stats.record_launch_timings(launch_timings);
+
+        pending_reads[next_slot] = Some(issued_reads);
 
         if let Some(transformed) = transformed {
             let send_start = Instant::now();
@@ -1432,7 +1442,7 @@ async fn append_transformed_batches_via_gds(
         next_slot = (next_slot + 1) % PIPELINE_SLOTS;
     }
 
-    for slot in &mut slots {
+    for (slot_idx, slot) in slots.iter_mut().enumerate() {
         let drain_start = Instant::now();
         if let Some(transformed) = slot.drain_to_batch(code_width)? {
             stats.drain += drain_start.elapsed();
@@ -1447,6 +1457,11 @@ async fn append_transformed_batches_via_gds(
             stats.send += send_start.elapsed();
         } else {
             stats.drain += drain_start.elapsed();
+        }
+        if let Some(prior_reads) = pending_reads[slot_idx].take() {
+            for (future, expected_bytes) in prior_reads {
+                finish_gds_read_async(future, expected_bytes)?;
+            }
         }
     }
     stats.log();
