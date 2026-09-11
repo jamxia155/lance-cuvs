@@ -384,48 +384,6 @@ impl<T: DlElement> DeviceTensor<T> {
         )
     }
 
-    /// Stream-ordered counterpart to `read_from_gds`: enqueues the read onto `stream` via
-    /// `cuvsReadLargeFileAsync` and returns immediately (like `copy_from_host_async`), instead of
-    /// blocking the calling thread for the read's duration. The returned `GdsReadFuture` must be
-    /// finished (via `finish_gds_read_async`) only after `stream` has been synchronized past this
-    /// read -- see `GdsReadFuture`'s own doc comment.
-    pub(crate) fn read_from_gds_async(
-        &mut self,
-        path: &str,
-        file_offset: u64,
-        dst_offset_bytes: usize,
-        len_bytes: usize,
-        stream: cuvs_sys::cudaStream_t,
-    ) -> Result<GdsReadFuture> {
-        let end = dst_offset_bytes
-            .checked_add(len_bytes)
-            .ok_or_else(|| Error::io("GDS read destination range overflow"))?;
-        if end > self.capacity_bytes {
-            return Err(Error::io(format!(
-                "GDS read destination range {dst_offset_bytes}..{end} exceeds device tensor capacity {}",
-                self.capacity_bytes
-            )));
-        }
-        let path_c = std::ffi::CString::new(path)
-            .map_err(|error| Error::io(format!("GDS read path contains NUL byte: {error}")))?;
-        let dst_ptr = unsafe { (self.tensor.dl_tensor.data as *mut u8).add(dst_offset_bytes) as *mut c_void };
-        let mut future_out: cuvs_sys::cuvsGdsReadFuture_t = ptr::null_mut();
-        check_cuvs(
-            unsafe {
-                cuvs_sys::cuvsReadLargeFileAsync(
-                    path_c.as_ptr(),
-                    dst_ptr,
-                    len_bytes,
-                    file_offset,
-                    stream,
-                    &mut future_out,
-                )
-            },
-            "begin async GDS read",
-        )?;
-        Ok(GdsReadFuture(future_out))
-    }
-
     pub(crate) fn copy_to_host_async(&self, resources: &Resources, dst: &mut [T]) -> Result<()> {
         let expected_len = self.current_len();
         if dst.len() != expected_len {
@@ -660,37 +618,6 @@ impl Drop for CudaEvent {
             let _ = unsafe { cudaEventDestroy(self.raw) };
         }
     }
-}
-
-/// A pending, stream-ordered GDS read started by `DeviceTensor::read_from_gds_async`.
-///
-/// Must be kept alive and passed to `finish_gds_read_async` only after the CUDA stream it was
-/// enqueued on has been synchronized past it (e.g. via `CudaEvent::synchronize` on an event
-/// recorded after the read on that stream) -- finishing it earlier is undefined behavior, per
-/// `cuvsFinishReadLargeFileAsync`'s own contract (which this wraps 1:1). Dropping it without
-/// calling `finish_gds_read_async` leaks the underlying C++ object -- deliberately not
-/// implemented as a `Drop` safety net, since a `Drop` impl running before the stream has been
-/// synchronized would itself be the same undefined-behavior violation this type exists to avoid;
-/// leaking on an already-erroneous path is the lesser failure mode.
-pub(crate) struct GdsReadFuture(cuvs_sys::cuvsGdsReadFuture_t);
-
-// Safety: this wraps an opaque C++ object (a kvikio StreamFuture + FileHandle pair) with no
-// thread-affinity of its own -- CUDA stream-ordered operations are inherently safe to enqueue
-// from one thread and wait on/finish from another (this is exactly what `cudaStreamSynchronize`
-// from a different thread than the enqueuing one already implies). This type exclusively owns the
-// underlying handle (never aliased, no shared mutable state), so moving it across a task/thread
-// boundary -- the entire reason this type exists -- is sound.
-unsafe impl Send for GdsReadFuture {}
-
-/// Completes a pending read started by `DeviceTensor::read_from_gds_async`. Must only be called
-/// after the CUDA stream the read was enqueued on has been synchronized past it -- see
-/// `GdsReadFuture`'s doc comment. `expected_bytes` is verified against the number of bytes
-/// actually read (`cuvsFinishReadLargeFileAsync` itself fails loudly on a short read).
-pub(crate) fn finish_gds_read_async(future: GdsReadFuture, expected_bytes: usize) -> Result<()> {
-    check_cuvs(
-        unsafe { cuvs_sys::cuvsFinishReadLargeFileAsync(future.0, expected_bytes) },
-        "finish async GDS read",
-    )
 }
 
 pub(crate) fn check_cuvs(status: cuvs_sys::cuvsError_t, context: &str) -> Result<()> {
