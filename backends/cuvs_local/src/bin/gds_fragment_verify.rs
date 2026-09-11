@@ -2,9 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Cross-check verification for `gds_layout::resolve_fragment_column` (2.1 "structural" format,
-//! non-nullable `FixedSizeList<f32>` only): resolves a fragment's vector column and reads it via
-//! `cuvsReadLargeFile`, then compares against the SAME rows fetched through Lance's own normal
-//! decode path (`dataset.scan()`), element-for-element (exact bit comparison, not approximate).
+//! non-nullable `FixedSizeList<f32>` only): resolves and GDS-reads *every* fragment's vector
+//! column via `cuvsReadLargeFile`, then compares the whole dataset against the SAME rows fetched
+//! through Lance's own normal decode path (`dataset.scan()`), element-for-element (exact bit
+//! comparison, not approximate).
 //! Given how much of `gds_layout.rs` is "derive the formula from static reading" rather than
 //! runtime-verified (see `profiling/GDS_PORTING_PLAN.md`), this is the essential empirical check
 //! before trusting it in the real `TransformSlot` pipeline.
@@ -77,66 +78,83 @@ async fn main() {
     });
 
     let fragments = dataset.get_fragments();
-    let fragment = fragments.first().unwrap_or_else(|| {
+    if fragments.is_empty() {
         eprintln!("dataset has no fragments");
         std::process::exit(1);
-    });
+    }
 
+    // Resolve + GDS-read every fragment, one at a time, appending each fragment's rows to
+    // `gds_values` in the same order `dataset.get_fragments()` returns them -- must match the
+    // physical row order the default full-dataset scan below produces (see its own comment) for
+    // this comparison to be meaningful across multiple fragments, not just within one.
     let dataset_root = Path::new(dataset_path);
-    let (local_path, plans) = resolve_fragment_column(&dataset, dataset_root, fragment, column, dim, 4)
-        .await
-        .unwrap_or_else(|error| {
-            eprintln!("resolve_fragment_column failed: {error}");
-            std::process::exit(1);
-        });
-    println!("resolved {} page(s) in {}", plans.len(), local_path.display());
-    for plan in &plans {
+    let mut gds_values: Vec<f32> = Vec::new();
+    let mut total_rows: u64 = 0;
+    for (fragment_index, fragment) in fragments.iter().enumerate() {
+        let (local_path, plans) =
+            resolve_fragment_column(&dataset, dataset_root, fragment, column, dim, 4)
+                .await
+                .unwrap_or_else(|error| {
+                    eprintln!("fragment {fragment_index}: resolve_fragment_column failed: {error}");
+                    std::process::exit(1);
+                });
+        let fragment_rows: u64 = plans.iter().map(|p| p.num_rows).sum();
         println!(
-            "  page: rows [{}, {}), values @ file_offset={} byte_len={}",
-            plan.row_start,
-            plan.row_start + plan.num_rows,
-            plan.file_offset,
-            plan.byte_len
+            "fragment {fragment_index}: resolved {} page(s), {fragment_rows} rows, in {}",
+            plans.len(),
+            local_path.display()
         );
-    }
-
-    let total_rows: u64 = plans.iter().map(|p| p.num_rows).sum();
-    let total_value_bytes = (total_rows * dim * 4) as usize;
-
-    let mut dev_ptr: *mut c_void = std::ptr::null_mut();
-    check_cuda(
-        unsafe { cudaMalloc(&mut dev_ptr, total_value_bytes) },
-        "allocate device buffer",
-    );
-
-    let path_c =
-        CString::new(local_path.to_str().expect("non-utf8 path")).expect("path contains NUL");
-    for plan in &plans {
-        let dst_offset_bytes = (plan.row_start * dim * 4) as usize;
-        let status = unsafe {
-            cuvs_sys::cuvsReadLargeFile(
-                path_c.as_ptr(),
-                (dev_ptr as *mut u8).add(dst_offset_bytes) as *mut c_void,
-                plan.byte_len as usize,
+        for plan in &plans {
+            println!(
+                "  page: rows [{}, {}), values @ file_offset={} byte_len={}",
+                plan.row_start,
+                plan.row_start + plan.num_rows,
                 plan.file_offset,
-            )
-        };
-        check_cuvs(status, "cuvsReadLargeFile");
-    }
+                plan.byte_len
+            );
+        }
 
-    let mut gds_values = vec![0f32; (total_rows * dim) as usize];
-    check_cuda(
-        unsafe {
-            cudaMemcpy(
-                gds_values.as_mut_ptr() as *mut c_void,
-                dev_ptr,
-                total_value_bytes,
-                CUDA_MEMCPY_DEVICE_TO_HOST,
-            )
-        },
-        "copy device buffer back to host for verification",
-    );
-    unsafe { cudaFree(dev_ptr) };
+        let fragment_value_bytes = (fragment_rows * dim * 4) as usize;
+        let mut dev_ptr: *mut c_void = std::ptr::null_mut();
+        check_cuda(
+            unsafe { cudaMalloc(&mut dev_ptr, fragment_value_bytes) },
+            "allocate device buffer",
+        );
+
+        let path_c = CString::new(local_path.to_str().expect("non-utf8 path"))
+            .expect("path contains NUL");
+        for plan in &plans {
+            // `plan.row_start` is relative to this fragment, not the whole dataset -- matches
+            // the destination buffer, which is sized/allocated per-fragment here too.
+            let dst_offset_bytes = (plan.row_start * dim * 4) as usize;
+            let status = unsafe {
+                cuvs_sys::cuvsReadLargeFile(
+                    path_c.as_ptr(),
+                    (dev_ptr as *mut u8).add(dst_offset_bytes) as *mut c_void,
+                    plan.byte_len as usize,
+                    plan.file_offset,
+                )
+            };
+            check_cuvs(status, "cuvsReadLargeFile");
+        }
+
+        let fragment_start = gds_values.len();
+        gds_values.resize(fragment_start + (fragment_rows * dim) as usize, 0f32);
+        check_cuda(
+            unsafe {
+                cudaMemcpy(
+                    gds_values[fragment_start..].as_mut_ptr() as *mut c_void,
+                    dev_ptr,
+                    fragment_value_bytes,
+                    CUDA_MEMCPY_DEVICE_TO_HOST,
+                )
+            },
+            "copy device buffer back to host for verification",
+        );
+        unsafe { cudaFree(dev_ptr) };
+        total_rows += fragment_rows;
+    }
+    println!("resolved {} fragment(s), {total_rows} rows total", fragments.len());
 
     // Ground truth: Lance's own normal decode path. Default scan order deliberately used (not
     // scan_in_order(false), which the real production pipeline uses for throughput) -- physical
