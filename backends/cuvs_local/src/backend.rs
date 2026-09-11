@@ -402,6 +402,22 @@ struct PreparedTransformBatch {
     input_registration: Option<RegisteredHostBuffer>,
 }
 
+/// One resolved, ready-to-issue GDS read: `len_bytes` starting at `file_offset` in `path`, landing
+/// at `dst_offset_bytes` within a `TransformSlot`'s `input_device` buffer.
+///
+/// A single batch typically needs more than one of these -- a fragment's row range can span
+/// several physical pages, each independently offset-resolved (see the byte-range-resolution
+/// design notes in `profiling/GDS_PORTING_PLAN.md`, "Fragment byte-range resolution research").
+/// Resolving `path`/`file_offset`/`dst_offset_bytes` from a fragment + row range is Lance-format
+/// knowledge that does not yet exist on this branch -- not yet implemented, tracked as an open
+/// item in that doc.
+struct GdsRead {
+    path: String,
+    file_offset: u64,
+    dst_offset_bytes: usize,
+    len_bytes: usize,
+}
+
 struct DrainedTransformBatch {
     batch: RecordBatch,
     h2d: Duration,
@@ -506,6 +522,71 @@ impl TransformSlot {
                 self.input_matrix = Some(array);
             }
         }
+        let transform_call_start = Instant::now();
+        check_cuvs(
+            unsafe {
+                cuvs_sys::cuvsIvfPqTransform(
+                    trained.resources.0,
+                    trained.index.raw,
+                    self.input_device.as_mut_ptr(),
+                    self.labels_device.as_mut_ptr(),
+                    self.codes_device.as_mut_ptr(),
+                )
+            },
+            "transform vectors with IVF_PQ",
+        )?;
+        timings.transform_call += transform_call_start.elapsed();
+        self.transform_done.record(stream)?;
+        let d2h_enqueue_start = Instant::now();
+        self.labels_device
+            .copy_to_host_async(&trained.resources, self.labels_host.prefix_mut(rows)?)?;
+        self.codes_device.copy_to_host_async(
+            &trained.resources,
+            self.codes_host.prefix_mut(rows * code_width)?,
+        )?;
+        timings.d2h_enqueue += d2h_enqueue_start.elapsed();
+        self.output_ready.record(stream)?;
+        Ok(timings)
+    }
+
+    /// GDS counterpart to `launch()`: fills `input_device` via a sequence of `read_from_gds` calls
+    /// (already-resolved `reads`) instead of `copy_from_host_async` from a host-decoded matrix.
+    /// Everything downstream (transform call, D2H copy, event bracketing) is identical to `launch`
+    /// -- `drain_to_batch` doesn't need to know or care which path populated the slot.
+    fn launch_gds(
+        &mut self,
+        trained: &TrainedIvfPqIndex,
+        stream: cuvs_sys::cudaStream_t,
+        row_ids: Arc<dyn Array>,
+        rows: usize,
+        dimension: usize,
+        reads: &[GdsRead],
+    ) -> Result<LaunchTimings> {
+        let mut timings = LaunchTimings::default();
+        let code_width = trained.pq_code_width();
+
+        self.input_device.set_shape(&[rows, dimension])?;
+        self.labels_device.set_shape(&[rows])?;
+        self.codes_device.set_shape(&[rows, code_width])?;
+        self.rows = rows;
+        self.row_ids = Some(row_ids);
+        self.input_registration = None;
+        self.input_vectors = None;
+        self.input_matrix = None;
+
+        self.h2d_start.record(stream)?;
+        let h2d_enqueue_start = Instant::now();
+        for read in reads {
+            self.input_device.read_from_gds(
+                &read.path,
+                read.file_offset,
+                read.dst_offset_bytes,
+                read.len_bytes,
+            )?;
+        }
+        timings.h2d_enqueue += h2d_enqueue_start.elapsed();
+        self.h2d_done.record(stream)?;
+
         let transform_call_start = Instant::now();
         check_cuvs(
             unsafe {

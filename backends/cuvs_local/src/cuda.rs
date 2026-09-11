@@ -347,6 +347,43 @@ impl<T: DlElement> DeviceTensor<T> {
         )
     }
 
+    /// Reads `len_bytes` directly into the device tensor's buffer at `dst_offset_bytes`, via
+    /// `cuvsReadLargeFile`, starting at `file_offset` in the file at `path`.
+    ///
+    /// `dst_offset_bytes`/`len_bytes` (rather than always filling the whole tensor) let a caller
+    /// issue several reads into one buffer -- needed since a single batch's rows can span multiple
+    /// physical pages within a fragment, each landing at a different device-buffer offset.
+    ///
+    /// Unlike `copy_from_host_async`, this is **synchronous** -- `cuvsReadLargeFile` has no CUDA
+    /// stream parameter (kvikio manages its own read concurrency internally, not via CUDA
+    /// streams), so the call blocks the calling thread until the read completes. Confirmed against
+    /// real GDS hardware (not just compat-mode fallback), see `gds_read_smoke_test.rs` and
+    /// `profiling/GDS_PORTING_PLAN.md`.
+    pub(crate) fn read_from_gds(
+        &mut self,
+        path: &str,
+        file_offset: u64,
+        dst_offset_bytes: usize,
+        len_bytes: usize,
+    ) -> Result<()> {
+        let end = dst_offset_bytes
+            .checked_add(len_bytes)
+            .ok_or_else(|| Error::io("GDS read destination range overflow"))?;
+        if end > self.capacity_bytes {
+            return Err(Error::io(format!(
+                "GDS read destination range {dst_offset_bytes}..{end} exceeds device tensor capacity {}",
+                self.capacity_bytes
+            )));
+        }
+        let path_c = std::ffi::CString::new(path)
+            .map_err(|error| Error::io(format!("GDS read path contains NUL byte: {error}")))?;
+        let dst_ptr = unsafe { (self.tensor.dl_tensor.data as *mut u8).add(dst_offset_bytes) as *mut c_void };
+        check_cuvs(
+            unsafe { cuvs_sys::cuvsReadLargeFile(path_c.as_ptr(), dst_ptr, len_bytes, file_offset) },
+            "read device tensor via GDS",
+        )
+    }
+
     pub(crate) fn copy_to_host_async(&self, resources: &Resources, dst: &mut [T]) -> Result<()> {
         let expected_len = self.current_len();
         if dst.len() != expected_len {

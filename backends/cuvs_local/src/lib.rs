@@ -13,6 +13,10 @@
 
 mod backend;
 mod cuda;
+// `pub`, not `mod` -- the standalone `gds_fragment_verify` bin target (a separate crate within
+// this package) needs to call into this module's resolver directly, matching the archived 2.0
+// prototype's `gds_fragment_verify.rs` precedent.
+pub mod gds_layout;
 #[cfg(feature = "python")]
 mod python;
 

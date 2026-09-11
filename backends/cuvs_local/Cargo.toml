@@ -42,6 +42,9 @@ libc = "0.2"
 lance = { path = "../../../lance/rust/lance" }
 lance-arrow = { path = "../../../lance/rust/lance-arrow" }
 lance-core = { path = "../../../lance/rust/lance-core" }
+# For gds_layout.rs's byte-range resolution -- reaches lance_encoding::decoder::{ColumnInfo,
+# PageInfo} and lance_encoding::format::pb21 directly, bypassing the normal decode scheduler.
+lance-encoding = { path = "../../../lance/rust/lance-encoding" }
 lance-file = { path = "../../../lance/rust/lance-file" }
 lance-index = { path = "../../../lance/rust/lance-index" }
 lance-io = { path = "../../../lance/rust/lance-io" }
@@ -52,4 +55,6 @@ pyo3 = { version = "0.26", optional = true, features = [
     "extension-module",
     "abi3-py312",
 ] }
-tokio = { version = "1.48", features = ["rt-multi-thread"] }
+# "macros" added for #[tokio::main] in src/bin/gds_fragment_verify.rs -- nothing else in this
+# crate builds its own top-level runtime (backend.rs is a library, driven from Python).
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros"] }
