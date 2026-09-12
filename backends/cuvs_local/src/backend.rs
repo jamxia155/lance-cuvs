@@ -36,7 +36,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const PARTITION_ARTIFACT_METADATA_FILE_NAME: &str = "metadata.lance";
-const PIPELINE_SLOTS: usize = 4;
+const PIPELINE_SLOTS: usize = 2;
+// Deliberately separate from `PIPELINE_SLOTS`: that constant also sizes the non-GDS scan pipeline
+// (`scan_transform_batches`) and the artifact-append channel shared by both paths, so widening it
+// would double buffers/queue capacity for the CPU path too. This one only sizes the GDS prefetch
+// pipeline's device-buffer slots (see `run_gds_prefetch_pipeline`) -- see
+// `profiling/GDS_PORTING_PLAN.md` for why 2 wasn't enough to consistently hide the read behind the
+// transform.
+const GDS_PIPELINE_SLOTS: usize = 4;
 const DEFAULT_SCAN_FRAGMENT_READAHEAD: usize = 0;
 const DEFAULT_SCAN_IO_BUFFER_SIZE: u64 = 16 * 1024 * 1024 * 1024;
 const DEFAULT_SCAN_BATCH_READAHEAD: usize = 32;
@@ -1545,7 +1552,7 @@ async fn append_transformed_batches_via_gds(
         .max()
         .unwrap_or(0);
 
-    let mut slots = (0..PIPELINE_SLOTS)
+    let mut slots = (0..GDS_PIPELINE_SLOTS)
         .map(|_| TransformSlot::try_new(&trained.resources, max_fragment_rows, dimension, code_width))
         .collect::<Result<Vec<_>>>()?;
     // Outer prefetch tasks (see `spawn_fragment_prefetch`) spawned ahead of time for the next
@@ -1554,7 +1561,7 @@ async fn append_transformed_batches_via_gds(
     // cuvsIvfPqTransform's own internal sync, that input_device is free) -- see the safety comment
     // below, right before it's populated.
     let mut pending: Vec<Option<tokio::task::JoinHandle<Result<Option<FragmentPrefetch>>>>> =
-        (0..PIPELINE_SLOTS).map(|_| None).collect();
+        (0..GDS_PIPELINE_SLOTS).map(|_| None).collect();
     let mut stats = ArtifactBuildStats::default();
     // TEMPORARY diagnostic timeline (see profiling/GDS_PORTING_PLAN.md) -- remove once the
     // overlap question is settled either way. Each line is tagged `frag=N slot=S` so concurrent
@@ -1623,13 +1630,13 @@ async fn run_gds_prefetch_pipeline(
     append_tx: &mut mpsc::Sender<Result<RecordBatch>>,
 ) -> Result<()> {
     for i in 0..fragments.len() {
-        let slot_idx = i % PIPELINE_SLOTS;
+        let slot_idx = i % GDS_PIPELINE_SLOTS;
         let timeline_tag = || format!("frag={i} slot={slot_idx}");
 
         // Fragment i's reads: either already running in the background (spawned as an outer
-        // tokio::spawn task after fragment i-PIPELINE_SLOTS's launch, below) or, for this slot's
-        // first use, spawn-and-await inline now (no overlap for the first PIPELINE_SLOTS
-        // fragments -- unavoidable startup cost).
+        // tokio::spawn task after fragment i-GDS_PIPELINE_SLOTS's launch, below) or, for this
+        // slot's first use, spawn-and-await inline now (no overlap for the first
+        // GDS_PIPELINE_SLOTS fragments -- unavoidable startup cost).
         let prefetch = match pending[slot_idx].take() {
             Some(handle) => {
                 handle
@@ -1714,10 +1721,10 @@ async fn run_gds_prefetch_pipeline(
         // reader of input_device -- has genuinely finished, regardless of CUDA stream state.
         // Spawning any earlier (e.g. before this call) would race the read against fragment i's
         // own not-yet-issued transform.
-        if i + PIPELINE_SLOTS < fragments.len() {
+        if i + GDS_PIPELINE_SLOTS < fragments.len() {
             let dst_ptr = slot.input_device.device_ptr();
             let dst_capacity = slot.input_device.capacity_bytes();
-            let next_tag = format!("frag={} slot={slot_idx}", i + PIPELINE_SLOTS);
+            let next_tag = format!("frag={} slot={slot_idx}", i + GDS_PIPELINE_SLOTS);
             eprintln!(
                 "[gds-timeline] {next_tag} spawning prefetch t={:.3}s",
                 pipeline_start.elapsed().as_secs_f64()
@@ -1725,7 +1732,7 @@ async fn run_gds_prefetch_pipeline(
             pending[slot_idx] = Some(spawn_fragment_prefetch(
                 dataset.clone(),
                 dataset_root.to_path_buf(),
-                fragments[i + PIPELINE_SLOTS].clone(),
+                fragments[i + GDS_PIPELINE_SLOTS].clone(),
                 column.to_string(),
                 dimension as u64,
                 dst_ptr,
