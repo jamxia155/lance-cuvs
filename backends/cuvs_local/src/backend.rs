@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const PARTITION_ARTIFACT_METADATA_FILE_NAME: &str = "metadata.lance";
-const PIPELINE_SLOTS: usize = 2;
+const PIPELINE_SLOTS: usize = 4;
 const DEFAULT_SCAN_FRAGMENT_READAHEAD: usize = 0;
 const DEFAULT_SCAN_IO_BUFFER_SIZE: u64 = 16 * 1024 * 1024 * 1024;
 const DEFAULT_SCAN_BATCH_READAHEAD: usize = 32;
