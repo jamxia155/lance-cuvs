@@ -1408,6 +1408,45 @@ async fn prefetch_fragment_gds_reads(
     }))
 }
 
+/// Spawns `prefetch_fragment_gds_reads` itself as an independent `tokio::spawn` task, rather than
+/// `.await`ing it inline on the caller's task. This matters: `prefetch_fragment_gds_reads` does
+/// real async I/O (`resolve_fragment_column`/`fragment_row_ids`, both going through Lance's
+/// metadata/scanner machinery) *before* it ever calls `spawn_gds_reads` -- if that resolution were
+/// awaited inline (as an earlier version of this code did), it would consume part of the very
+/// overlap window the caller is trying to use for something else (the *previous* fragment's
+/// blocking `cuvsIvfPqTransform` call), rather than running concurrently with it. Wrapping the
+/// whole thing in `tokio::spawn` lets resolution start running as soon as this returns, not only
+/// once the caller gets around to awaiting the result.
+///
+/// Needs owned/cloned inputs (`Dataset`/`FileFragment` are cheap, `Arc`-backed clones -- matches
+/// the pattern `scan_transform_batches` already uses elsewhere in this file), since `tokio::spawn`
+/// requires `'static`, ruling out borrowing from the caller's stack frame. `dst_ptr` is cast to a
+/// `usize` for the same `Send`-boundary reason `spawn_gds_reads` already does.
+fn spawn_fragment_prefetch(
+    dataset: Dataset,
+    dataset_root: PathBuf,
+    fragment: FileFragment,
+    column: String,
+    dimension: u64,
+    dst_ptr: *mut std::ffi::c_void,
+    dst_capacity_bytes: usize,
+) -> tokio::task::JoinHandle<Result<Option<FragmentPrefetch>>> {
+    let dst_addr = dst_ptr as usize;
+    tokio::spawn(async move {
+        let dst_ptr = dst_addr as *mut std::ffi::c_void;
+        prefetch_fragment_gds_reads(
+            &dataset,
+            &dataset_root,
+            &fragment,
+            &column,
+            dimension,
+            dst_ptr,
+            dst_capacity_bytes,
+        )
+        .await
+    })
+}
+
 /// GDS counterpart to `append_transformed_batches_to_artifact`: reads straight from disk into
 /// device memory via `cuvsReadLargeFile`, skipping the host scan/decode/matrix-packing pipeline
 /// entirely. Overlaps a fragment's read with the *previous* fragment's transform by running it on
@@ -1475,21 +1514,28 @@ async fn append_transformed_batches_via_gds(
     let mut slots = (0..PIPELINE_SLOTS)
         .map(|_| TransformSlot::try_new(&trained.resources, max_fragment_rows, dimension, code_width))
         .collect::<Result<Vec<_>>>()?;
-    // Reads spawned ahead of time for the next fragment that will reuse a given slot, indexed by
-    // slot. Only ever populated *after* that slot's current occupant's launch_gds_prefetched call
-    // has returned (confirming, via cuvsIvfPqTransform's own internal sync, that input_device is
-    // free) -- see the safety comment below, right before it's populated.
-    let mut pending: Vec<Option<FragmentPrefetch>> = (0..PIPELINE_SLOTS).map(|_| None).collect();
+    // Outer prefetch tasks (see `spawn_fragment_prefetch`) spawned ahead of time for the next
+    // fragment that will reuse a given slot, indexed by slot. Only ever populated *after* that
+    // slot's current occupant's launch_gds_prefetched call has returned (confirming, via
+    // cuvsIvfPqTransform's own internal sync, that input_device is free) -- see the safety comment
+    // below, right before it's populated.
+    let mut pending: Vec<Option<tokio::task::JoinHandle<Result<Option<FragmentPrefetch>>>>> =
+        (0..PIPELINE_SLOTS).map(|_| None).collect();
     let mut stats = ArtifactBuildStats::default();
 
     for i in 0..fragments.len() {
         let slot_idx = i % PIPELINE_SLOTS;
 
-        // Fragment i's reads: either already running in the background (spawned after fragment
-        // i-PIPELINE_SLOTS's launch, below) or, for this slot's first use, spawn-and-await inline
-        // now (no overlap for the first PIPELINE_SLOTS fragments -- unavoidable startup cost).
+        // Fragment i's reads: either already running in the background (spawned as an outer
+        // tokio::spawn task after fragment i-PIPELINE_SLOTS's launch, below) or, for this slot's
+        // first use, spawn-and-await inline now (no overlap for the first PIPELINE_SLOTS
+        // fragments -- unavoidable startup cost).
         let prefetch = match pending[slot_idx].take() {
-            Some(prefetch) => Some(prefetch),
+            Some(handle) => {
+                handle
+                    .await
+                    .map_err(|error| Error::io(format!("GDS prefetch task panicked: {error}")))??
+            }
             None => {
                 let dst_ptr = slots[slot_idx].input_device.device_ptr();
                 let dst_capacity = slots[slot_idx].input_device.capacity_bytes();
@@ -1549,16 +1595,15 @@ async fn append_transformed_batches_via_gds(
         if i + PIPELINE_SLOTS < fragments.len() {
             let dst_ptr = slot.input_device.device_ptr();
             let dst_capacity = slot.input_device.capacity_bytes();
-            pending[slot_idx] = prefetch_fragment_gds_reads(
-                dataset,
-                &dataset_root,
-                &fragments[i + PIPELINE_SLOTS],
-                column,
+            pending[slot_idx] = Some(spawn_fragment_prefetch(
+                dataset.clone(),
+                dataset_root.clone(),
+                fragments[i + PIPELINE_SLOTS].clone(),
+                column.to_string(),
                 dimension as u64,
                 dst_ptr,
                 dst_capacity,
-            )
-            .await?;
+            ));
         }
 
         if let Some(transformed) = transformed {
