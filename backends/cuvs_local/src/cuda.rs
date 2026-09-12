@@ -359,6 +359,25 @@ impl<T: DlElement> DeviceTensor<T> {
     /// streams), so the call blocks the calling thread until the read completes. Confirmed against
     /// real GDS hardware (not just compat-mode fallback), see `gds_read_smoke_test.rs` and
     /// `profiling/GDS_PORTING_PLAN.md`.
+    /// Raw device pointer to this tensor's buffer, valid for its full `capacity_bytes` (not just
+    /// the currently-set shape). Needed to fill the buffer from a `tokio::task::spawn_blocking`
+    /// background task (e.g. to overlap a GDS read with `cuvsIvfPqTransform`'s own internal
+    /// blocking behavior -- see `profiling/GDS_PORTING_PLAN.md`) -- `spawn_blocking`'s `F: Send`
+    /// bound rules out capturing `&mut DeviceTensor` directly, but a raw pointer value is `Send`.
+    /// The caller is responsible for the same safety discipline `read_from_gds` already enforces
+    /// (writes must land within `capacity_bytes`, and must not race a concurrent read/write to the
+    /// same bytes).
+    pub(crate) fn device_ptr(&self) -> *mut c_void {
+        self.tensor.dl_tensor.data
+    }
+
+    /// Total allocated capacity in bytes, independent of the currently-set shape -- for callers
+    /// (e.g. `device_ptr`'s users) that need to bounds-check a write against the buffer's real
+    /// size before the shape reflects it.
+    pub(crate) fn capacity_bytes(&self) -> usize {
+        self.capacity_bytes
+    }
+
     pub(crate) fn read_from_gds(
         &mut self,
         path: &str,

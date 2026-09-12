@@ -552,18 +552,25 @@ impl TransformSlot {
         Ok(timings)
     }
 
-    /// GDS counterpart to `launch()`: fills `input_device` via a sequence of `read_from_gds` calls
-    /// (already-resolved `reads`) instead of `copy_from_host_async` from a host-decoded matrix.
-    /// Everything downstream (transform call, D2H copy, event bracketing) is identical to `launch`
-    /// -- `drain_to_batch` doesn't need to know or care which path populated the slot.
-    fn launch_gds(
+    /// GDS counterpart to `launch()`, for when `input_device` has already been filled by the
+    /// caller -- only sets up shape/bookkeeping and issues the transform + D2H copy. The read
+    /// itself happens on a separate OS thread via `tokio::task::spawn_blocking`
+    /// (`append_transformed_batches_via_gds`'s `spawn_gds_reads`), run concurrently with the
+    /// *previous* fragment's `cuvsIvfPqTransform` call -- which blocks the calling host thread via
+    /// its own internal `raft::resource::sync_stream` regardless of what's enqueued on the CUDA
+    /// stream, so stream-ordering the read ahead of the transform call (tried first, reverted --
+    /// see `profiling/GDS_PORTING_PLAN.md`) can't achieve overlap on its own; OS-thread-level
+    /// concurrency can, since the sync only blocks the thread that calls `cuvsIvfPqTransform`, not
+    /// a GDS read issued concurrently from a different thread. Since the read isn't stream work
+    /// anymore, `h2d_start`/`h2d_done` bracket essentially nothing here (`h2d_s` reports ~0) --
+    /// real read cost now shows up as wall-clock time in the caller, not a GPU event.
+    fn launch_gds_prefetched(
         &mut self,
         trained: &TrainedIvfPqIndex,
         stream: cuvs_sys::cudaStream_t,
         row_ids: Arc<dyn Array>,
         rows: usize,
         dimension: usize,
-        reads: &[GdsRead],
     ) -> Result<LaunchTimings> {
         let mut timings = LaunchTimings::default();
         let code_width = trained.pq_code_width();
@@ -578,16 +585,6 @@ impl TransformSlot {
         self.input_matrix = None;
 
         self.h2d_start.record(stream)?;
-        let h2d_enqueue_start = Instant::now();
-        for read in reads {
-            self.input_device.read_from_gds(
-                &read.path,
-                read.file_offset,
-                read.dst_offset_bytes,
-                read.len_bytes,
-            )?;
-        }
-        timings.h2d_enqueue += h2d_enqueue_start.elapsed();
         self.h2d_done.record(stream)?;
 
         let transform_call_start = Instant::now();
@@ -1301,12 +1298,125 @@ async fn append_transformed_batches_to_artifact(
     Ok(())
 }
 
+/// Spawns a background OS thread (`tokio::task::spawn_blocking`) that issues `reads` sequentially
+/// against `dst_ptr` via the plain synchronous `cuvsReadLargeFile`. Meant to run concurrently with
+/// a *different* fragment's blocking `cuvsIvfPqTransform` call -- `cuvsIvfPqTransform` internally
+/// calls `raft::resource::sync_stream` unconditionally before returning (confirmed by reading
+/// `cpp/src/neighbors/ivf_pq/ivf_pq_transform.cuh:171` in the `cuvs` checkout), so it blocks the
+/// calling host thread regardless of CUDA stream ordering -- a stream-ordered async read (tried
+/// first, reverted, see `profiling/GDS_PORTING_PLAN.md`) can't overlap with it, but a read issued
+/// concurrently from a *different* OS thread can, since the sync only blocks the thread that calls
+/// `cuvsIvfPqTransform`.
+///
+/// `dst_ptr` is cast to a `usize` to cross `spawn_blocking`'s `Send` bound -- sound because it's
+/// just an address (CUDA device pointers have no thread affinity) and the caller guarantees no
+/// other read/write touches the same bytes until this task's `JoinHandle` is awaited (see
+/// `append_transformed_batches_via_gds`'s slot-buffer-reuse-safety reasoning).
+fn spawn_gds_reads(
+    dst_ptr: *mut std::ffi::c_void,
+    reads: Vec<GdsRead>,
+) -> tokio::task::JoinHandle<Result<()>> {
+    let dst_addr = dst_ptr as usize;
+    tokio::task::spawn_blocking(move || {
+        let dst_ptr = dst_addr as *mut std::ffi::c_void;
+        for read in &reads {
+            let path_c = std::ffi::CString::new(read.path.as_str()).map_err(|error| {
+                Error::io(format!("GDS read path contains NUL byte: {error}"))
+            })?;
+            let dest =
+                unsafe { (dst_ptr as *mut u8).add(read.dst_offset_bytes) as *mut std::ffi::c_void };
+            check_cuvs(
+                unsafe {
+                    cuvs_sys::cuvsReadLargeFile(path_c.as_ptr(), dest, read.len_bytes, read.file_offset)
+                },
+                "read via GDS (background prefetch)",
+            )?;
+        }
+        Ok(())
+    })
+}
+
+/// A fragment's GDS reads, already spawned on a background thread (see `spawn_gds_reads`), plus
+/// the row-ids/row-count needed to finish launching the transform once the reads land.
+struct FragmentPrefetch {
+    handle: tokio::task::JoinHandle<Result<()>>,
+    row_ids: Arc<dyn Array>,
+    rows: usize,
+}
+
+/// Resolves `fragment`'s byte ranges (metadata-scale) and row ids, then spawns its GDS reads (see
+/// `spawn_gds_reads`) into `dst_ptr`/`dst_capacity_bytes`. Returns `None` for an empty (zero-row)
+/// fragment -- nothing to read or transform.
+async fn prefetch_fragment_gds_reads(
+    dataset: &Dataset,
+    dataset_root: &std::path::Path,
+    fragment: &FileFragment,
+    column: &str,
+    dimension: u64,
+    dst_ptr: *mut std::ffi::c_void,
+    dst_capacity_bytes: usize,
+) -> Result<Option<FragmentPrefetch>> {
+    let (local_path, plans) =
+        resolve_fragment_column(dataset, dataset_root, fragment, column, dimension, 4).await?;
+    let rows: u64 = plans.iter().map(|plan| plan.num_rows).sum();
+    if rows == 0 {
+        return Ok(None);
+    }
+
+    let row_ids = fragment_row_ids(dataset, fragment).await?;
+    if row_ids.len() != rows as usize {
+        return Err(Error::io(format!(
+            "fragment {}: row-id count {} does not match GDS-resolved row count {rows}",
+            fragment.metadata().id,
+            row_ids.len()
+        )));
+    }
+
+    let path_str = local_path.to_str().ok_or_else(|| {
+        Error::io(format!(
+            "GDS data file path is not valid UTF-8: {}",
+            local_path.display()
+        ))
+    })?;
+    let reads: Vec<GdsRead> = plans
+        .iter()
+        .map(|plan| {
+            let dst_offset_bytes = (plan.row_start * dimension * 4) as usize;
+            let len_bytes = plan.byte_len as usize;
+            let end = dst_offset_bytes
+                .checked_add(len_bytes)
+                .ok_or_else(|| Error::io("GDS read destination range overflow"))?;
+            if end > dst_capacity_bytes {
+                return Err(Error::io(format!(
+                    "GDS read destination range {dst_offset_bytes}..{end} exceeds device tensor \
+                     capacity {dst_capacity_bytes}"
+                )));
+            }
+            Ok(GdsRead {
+                path: path_str.to_string(),
+                file_offset: plan.file_offset,
+                dst_offset_bytes,
+                len_bytes,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(Some(FragmentPrefetch {
+        handle: spawn_gds_reads(dst_ptr, reads),
+        row_ids,
+        rows: rows as usize,
+    }))
+}
+
 /// GDS counterpart to `append_transformed_batches_to_artifact`: reads straight from disk into
-/// device memory via `cuvsReadLargeFile` (`TransformSlot::launch_gds`), skipping the host
-/// scan/decode/matrix-packing pipeline entirely. Processes one whole fragment per slot-launch
-/// (not a `batch_size` chunk) -- `gds_layout::resolve_fragment_column` only resolves a fragment's
-/// entire row range, not arbitrary sub-ranges, so device buffers are sized to the largest
-/// fragment up front rather than a configurable batch size.
+/// device memory via `cuvsReadLargeFile`, skipping the host scan/decode/matrix-packing pipeline
+/// entirely. Overlaps a fragment's read with the *previous* fragment's transform by running it on
+/// a background thread (`spawn_gds_reads`) rather than inline -- see that function's doc comment
+/// for why stream-ordering alone (tried first, reverted) couldn't achieve this. Processes one
+/// whole fragment per slot-launch (not a `batch_size` chunk) -- `gds_layout::
+/// resolve_fragment_column` only resolves a fragment's entire row range, not arbitrary
+/// sub-ranges, so device buffers are sized to the largest fragment up front rather than a
+/// configurable batch size.
 ///
 /// Narrower than the CPU path by design (see `gds_layout.rs`'s module docs): rejects
 /// `filter_nan=true` on a nullable column outright (real unsupported case, not silently ignored),
@@ -1365,44 +1475,50 @@ async fn append_transformed_batches_via_gds(
     let mut slots = (0..PIPELINE_SLOTS)
         .map(|_| TransformSlot::try_new(&trained.resources, max_fragment_rows, dimension, code_width))
         .collect::<Result<Vec<_>>>()?;
-    let mut next_slot = 0usize;
+    // Reads spawned ahead of time for the next fragment that will reuse a given slot, indexed by
+    // slot. Only ever populated *after* that slot's current occupant's launch_gds_prefetched call
+    // has returned (confirming, via cuvsIvfPqTransform's own internal sync, that input_device is
+    // free) -- see the safety comment below, right before it's populated.
+    let mut pending: Vec<Option<FragmentPrefetch>> = (0..PIPELINE_SLOTS).map(|_| None).collect();
     let mut stats = ArtifactBuildStats::default();
 
-    for fragment in fragments.iter() {
-        let (local_path, plans) =
-            resolve_fragment_column(dataset, &dataset_root, fragment, column, dimension as u64, 4)
-                .await?;
-        let rows: u64 = plans.iter().map(|plan| plan.num_rows).sum();
-        if rows == 0 {
+    for i in 0..fragments.len() {
+        let slot_idx = i % PIPELINE_SLOTS;
+
+        // Fragment i's reads: either already running in the background (spawned after fragment
+        // i-PIPELINE_SLOTS's launch, below) or, for this slot's first use, spawn-and-await inline
+        // now (no overlap for the first PIPELINE_SLOTS fragments -- unavoidable startup cost).
+        let prefetch = match pending[slot_idx].take() {
+            Some(prefetch) => Some(prefetch),
+            None => {
+                let dst_ptr = slots[slot_idx].input_device.device_ptr();
+                let dst_capacity = slots[slot_idx].input_device.capacity_bytes();
+                prefetch_fragment_gds_reads(
+                    dataset,
+                    &dataset_root,
+                    &fragments[i],
+                    column,
+                    dimension as u64,
+                    dst_ptr,
+                    dst_capacity,
+                )
+                .await?
+            }
+        };
+        let Some(prefetch) = prefetch else {
+            // Zero-row fragment -- nothing was ever read or launched into this slot for this
+            // iteration, so there's nothing to drain either; this slot's occupant is unchanged.
             continue;
-        }
+        };
 
-        let row_ids = fragment_row_ids(dataset, fragment).await?;
-        if row_ids.len() != rows as usize {
-            return Err(Error::io(format!(
-                "fragment {}: row-id count {} does not match GDS-resolved row count {rows}",
-                fragment.metadata().id,
-                row_ids.len()
-            )));
-        }
+        let wait_start = Instant::now();
+        prefetch
+            .handle
+            .await
+            .map_err(|error| Error::io(format!("GDS prefetch task panicked: {error}")))??;
+        let wait_elapsed = wait_start.elapsed(); // near-zero if overlap is actually working
 
-        let path_str = local_path.to_str().ok_or_else(|| {
-            Error::io(format!(
-                "GDS data file path is not valid UTF-8: {}",
-                local_path.display()
-            ))
-        })?;
-        let reads: Vec<GdsRead> = plans
-            .iter()
-            .map(|plan| GdsRead {
-                path: path_str.to_string(),
-                file_offset: plan.file_offset,
-                dst_offset_bytes: (plan.row_start * dimension as u64 * 4) as usize,
-                len_bytes: plan.byte_len as usize,
-            })
-            .collect();
-
-        let slot = &mut slots[next_slot];
+        let slot = &mut slots[slot_idx];
         let drain_start = Instant::now();
         let transformed = if let Some(transformed) = slot.drain_to_batch(code_width)? {
             stats.drain += drain_start.elapsed();
@@ -1414,10 +1530,36 @@ async fn append_transformed_batches_via_gds(
         };
 
         let launch_start = Instant::now();
-        let launch_timings =
-            slot.launch_gds(trained, cuda_stream, row_ids, rows as usize, dimension, &reads)?;
+        let mut launch_timings = slot.launch_gds_prefetched(
+            trained,
+            cuda_stream,
+            prefetch.row_ids,
+            prefetch.rows,
+            dimension,
+        )?;
+        launch_timings.h2d_enqueue += wait_elapsed;
         stats.launch += launch_start.elapsed();
         stats.record_launch_timings(launch_timings);
+
+        // Safe only now: launch_gds_prefetched's cuvsIvfPqTransform call just returned, and its
+        // own internal raft::resource::sync_stream guarantees the transform kernel -- the last
+        // reader of input_device -- has genuinely finished, regardless of CUDA stream state.
+        // Spawning any earlier (e.g. before this call) would race the read against fragment i's
+        // own not-yet-issued transform.
+        if i + PIPELINE_SLOTS < fragments.len() {
+            let dst_ptr = slot.input_device.device_ptr();
+            let dst_capacity = slot.input_device.capacity_bytes();
+            pending[slot_idx] = prefetch_fragment_gds_reads(
+                dataset,
+                &dataset_root,
+                &fragments[i + PIPELINE_SLOTS],
+                column,
+                dimension as u64,
+                dst_ptr,
+                dst_capacity,
+            )
+            .await?;
+        }
 
         if let Some(transformed) = transformed {
             let send_start = Instant::now();
@@ -1429,7 +1571,6 @@ async fn append_transformed_batches_via_gds(
                 })?;
             stats.send += send_start.elapsed();
         }
-        next_slot = (next_slot + 1) % PIPELINE_SLOTS;
     }
 
     for slot in &mut slots {
