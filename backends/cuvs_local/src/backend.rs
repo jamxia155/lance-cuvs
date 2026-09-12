@@ -1724,7 +1724,7 @@ async fn run_gds_prefetch_pipeline(
             );
             pending[slot_idx] = Some(spawn_fragment_prefetch(
                 dataset.clone(),
-                dataset_root.clone(),
+                dataset_root.to_path_buf(),
                 fragments[i + PIPELINE_SLOTS].clone(),
                 column.to_string(),
                 dimension as u64,
