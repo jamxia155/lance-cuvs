@@ -1345,15 +1345,22 @@ struct FragmentPrefetch {
 }
 
 /// Resolves `fragment`'s byte ranges (metadata-scale) and row ids, then spawns its GDS reads (see
-/// `spawn_gds_reads`) into `dst_ptr`/`dst_capacity_bytes`. Returns `None` for an empty (zero-row)
+/// `spawn_gds_reads`) into `dst_addr`/`dst_capacity_bytes`. Returns `None` for an empty (zero-row)
 /// fragment -- nothing to read or transform.
+///
+/// Takes `dst_addr` as a `usize` rather than `*mut c_void`: this function itself awaits
+/// (`resolve_fragment_column`/`fragment_row_ids`) before ever touching the destination pointer, so
+/// if it took a raw pointer directly, that pointer would be captured in this function's own future
+/// state across those awaits, making the future `!Send` -- and it needs to be `Send` to run inside
+/// `spawn_fragment_prefetch`'s outer `tokio::spawn`. Reconstituted into a pointer only at the very
+/// end, after the last await, right where it's passed to `spawn_gds_reads`.
 async fn prefetch_fragment_gds_reads(
     dataset: &Dataset,
     dataset_root: &std::path::Path,
     fragment: &FileFragment,
     column: &str,
     dimension: u64,
-    dst_ptr: *mut std::ffi::c_void,
+    dst_addr: usize,
     dst_capacity_bytes: usize,
 ) -> Result<Option<FragmentPrefetch>> {
     let (local_path, plans) =
@@ -1401,6 +1408,7 @@ async fn prefetch_fragment_gds_reads(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let dst_ptr = dst_addr as *mut std::ffi::c_void;
     Ok(Some(FragmentPrefetch {
         handle: spawn_gds_reads(dst_ptr, reads),
         row_ids,
@@ -1420,8 +1428,9 @@ async fn prefetch_fragment_gds_reads(
 ///
 /// Needs owned/cloned inputs (`Dataset`/`FileFragment` are cheap, `Arc`-backed clones -- matches
 /// the pattern `scan_transform_batches` already uses elsewhere in this file), since `tokio::spawn`
-/// requires `'static`, ruling out borrowing from the caller's stack frame. `dst_ptr` is cast to a
-/// `usize` for the same `Send`-boundary reason `spawn_gds_reads` already does.
+/// requires `'static`, ruling out borrowing from the caller's stack frame. `dst_ptr` is passed
+/// through as the `usize` address `prefetch_fragment_gds_reads` itself takes -- see that
+/// function's doc comment for why the raw pointer can't cross an await point.
 fn spawn_fragment_prefetch(
     dataset: Dataset,
     dataset_root: PathBuf,
@@ -1433,14 +1442,13 @@ fn spawn_fragment_prefetch(
 ) -> tokio::task::JoinHandle<Result<Option<FragmentPrefetch>>> {
     let dst_addr = dst_ptr as usize;
     tokio::spawn(async move {
-        let dst_ptr = dst_addr as *mut std::ffi::c_void;
         prefetch_fragment_gds_reads(
             &dataset,
             &dataset_root,
             &fragment,
             &column,
             dimension,
-            dst_ptr,
+            dst_addr,
             dst_capacity_bytes,
         )
         .await
@@ -1537,7 +1545,7 @@ async fn append_transformed_batches_via_gds(
                     .map_err(|error| Error::io(format!("GDS prefetch task panicked: {error}")))??
             }
             None => {
-                let dst_ptr = slots[slot_idx].input_device.device_ptr();
+                let dst_addr = slots[slot_idx].input_device.device_ptr() as usize;
                 let dst_capacity = slots[slot_idx].input_device.capacity_bytes();
                 prefetch_fragment_gds_reads(
                     dataset,
@@ -1545,7 +1553,7 @@ async fn append_transformed_batches_via_gds(
                     &fragments[i],
                     column,
                     dimension as u64,
-                    dst_ptr,
+                    dst_addr,
                     dst_capacity,
                 )
                 .await?
