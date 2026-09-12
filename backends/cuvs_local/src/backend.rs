@@ -1315,9 +1315,14 @@ async fn append_transformed_batches_to_artifact(
 fn spawn_gds_reads(
     dst_ptr: *mut std::ffi::c_void,
     reads: Vec<GdsRead>,
+    pipeline_start: Instant,
 ) -> tokio::task::JoinHandle<Result<()>> {
     let dst_addr = dst_ptr as usize;
     tokio::task::spawn_blocking(move || {
+        eprintln!(
+            "[gds-timeline] spawn_blocking closure started t={:.3}s",
+            pipeline_start.elapsed().as_secs_f64()
+        );
         let dst_ptr = dst_addr as *mut std::ffi::c_void;
         for read in &reads {
             let path_c = std::ffi::CString::new(read.path.as_str()).map_err(|error| {
@@ -1332,6 +1337,10 @@ fn spawn_gds_reads(
                 "read via GDS (background prefetch)",
             )?;
         }
+        eprintln!(
+            "[gds-timeline] spawn_blocking closure done t={:.3}s",
+            pipeline_start.elapsed().as_secs_f64()
+        );
         Ok(())
     })
 }
@@ -1362,9 +1371,14 @@ async fn prefetch_fragment_gds_reads(
     dimension: u64,
     dst_addr: usize,
     dst_capacity_bytes: usize,
+    pipeline_start: Instant,
 ) -> Result<Option<FragmentPrefetch>> {
     let (local_path, plans) =
         resolve_fragment_column(dataset, dataset_root, fragment, column, dimension, 4).await?;
+    eprintln!(
+        "[gds-timeline] resolve_fragment_column done t={:.3}s",
+        pipeline_start.elapsed().as_secs_f64()
+    );
     let rows: u64 = plans.iter().map(|plan| plan.num_rows).sum();
     if rows == 0 {
         return Ok(None);
@@ -1410,7 +1424,7 @@ async fn prefetch_fragment_gds_reads(
 
     let dst_ptr = dst_addr as *mut std::ffi::c_void;
     Ok(Some(FragmentPrefetch {
-        handle: spawn_gds_reads(dst_ptr, reads),
+        handle: spawn_gds_reads(dst_ptr, reads, pipeline_start),
         row_ids,
         rows: rows as usize,
     }))
@@ -1439,9 +1453,16 @@ fn spawn_fragment_prefetch(
     dimension: u64,
     dst_ptr: *mut std::ffi::c_void,
     dst_capacity_bytes: usize,
+    pipeline_start: Instant,
 ) -> tokio::task::JoinHandle<Result<Option<FragmentPrefetch>>> {
     let dst_addr = dst_ptr as usize;
+    let spawn_at = pipeline_start.elapsed().as_secs_f64();
     tokio::spawn(async move {
+        eprintln!(
+            "[gds-timeline] prefetch task polled t={:.3}s (spawned at t={:.3}s)",
+            pipeline_start.elapsed().as_secs_f64(),
+            spawn_at
+        );
         prefetch_fragment_gds_reads(
             &dataset,
             &dataset_root,
@@ -1450,6 +1471,7 @@ fn spawn_fragment_prefetch(
             dimension,
             dst_addr,
             dst_capacity_bytes,
+            pipeline_start,
         )
         .await
     })
@@ -1530,6 +1552,9 @@ async fn append_transformed_batches_via_gds(
     let mut pending: Vec<Option<tokio::task::JoinHandle<Result<Option<FragmentPrefetch>>>>> =
         (0..PIPELINE_SLOTS).map(|_| None).collect();
     let mut stats = ArtifactBuildStats::default();
+    // TEMPORARY diagnostic timeline (see profiling/GDS_PORTING_PLAN.md) -- remove once the
+    // overlap question is settled either way.
+    let pipeline_start = Instant::now();
 
     for i in 0..fragments.len() {
         let slot_idx = i % PIPELINE_SLOTS;
@@ -1555,6 +1580,7 @@ async fn append_transformed_batches_via_gds(
                     dimension as u64,
                     dst_addr,
                     dst_capacity,
+                    pipeline_start,
                 )
                 .await?
             }
@@ -1565,12 +1591,20 @@ async fn append_transformed_batches_via_gds(
             continue;
         };
 
+        eprintln!(
+            "[gds-timeline] fragment {i} begin wait for prefetch t={:.3}s",
+            pipeline_start.elapsed().as_secs_f64()
+        );
         let wait_start = Instant::now();
         prefetch
             .handle
             .await
             .map_err(|error| Error::io(format!("GDS prefetch task panicked: {error}")))??;
         let wait_elapsed = wait_start.elapsed(); // near-zero if overlap is actually working
+        eprintln!(
+            "[gds-timeline] fragment {i} prefetch wait done t={:.3}s",
+            pipeline_start.elapsed().as_secs_f64()
+        );
 
         let slot = &mut slots[slot_idx];
         let drain_start = Instant::now();
@@ -1583,6 +1617,10 @@ async fn append_transformed_batches_via_gds(
             None
         };
 
+        eprintln!(
+            "[gds-timeline] fragment {i} begin transform t={:.3}s",
+            pipeline_start.elapsed().as_secs_f64()
+        );
         let launch_start = Instant::now();
         let mut launch_timings = slot.launch_gds_prefetched(
             trained,
@@ -1591,6 +1629,10 @@ async fn append_transformed_batches_via_gds(
             prefetch.rows,
             dimension,
         )?;
+        eprintln!(
+            "[gds-timeline] fragment {i} transform done t={:.3}s",
+            pipeline_start.elapsed().as_secs_f64()
+        );
         launch_timings.h2d_enqueue += wait_elapsed;
         stats.launch += launch_start.elapsed();
         stats.record_launch_timings(launch_timings);
@@ -1603,6 +1645,11 @@ async fn append_transformed_batches_via_gds(
         if i + PIPELINE_SLOTS < fragments.len() {
             let dst_ptr = slot.input_device.device_ptr();
             let dst_capacity = slot.input_device.capacity_bytes();
+            eprintln!(
+                "[gds-timeline] spawning prefetch for fragment {} t={:.3}s",
+                i + PIPELINE_SLOTS,
+                pipeline_start.elapsed().as_secs_f64()
+            );
             pending[slot_idx] = Some(spawn_fragment_prefetch(
                 dataset.clone(),
                 dataset_root.clone(),
@@ -1611,6 +1658,7 @@ async fn append_transformed_batches_via_gds(
                 dimension as u64,
                 dst_ptr,
                 dst_capacity,
+                pipeline_start,
             ));
         }
 
