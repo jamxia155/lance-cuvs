@@ -363,10 +363,14 @@ impl<T: DlElement> DeviceTensor<T> {
     /// the currently-set shape). Needed to fill the buffer from a `tokio::task::spawn_blocking`
     /// background task (e.g. to overlap a GDS read with `cuvsIvfPqTransform`'s own internal
     /// blocking behavior -- see `profiling/GDS_PORTING_PLAN.md`) -- `spawn_blocking`'s `F: Send`
-    /// bound rules out capturing `&mut DeviceTensor` directly, but a raw pointer value is `Send`.
+    /// bound rules out capturing `&mut DeviceTensor` directly, and `*mut c_void` itself is *not*
+    /// `Send`, so callers must cast this to a `usize` before crossing into the spawned task and
+    /// cast back only once there (see `spawn_gds_reads` in `backend.rs`).
     /// The caller is responsible for the same safety discipline `read_from_gds` already enforces
     /// (writes must land within `capacity_bytes`, and must not race a concurrent read/write to the
-    /// same bytes).
+    /// same bytes), *and* must ensure this `DeviceTensor` outlives every task holding a
+    /// pointer/address derived from this call -- see the join-before-drop discipline in
+    /// `append_transformed_batches_via_gds`.
     pub(crate) fn device_ptr(&self) -> *mut c_void {
         self.tensor.dl_tensor.data
     }
