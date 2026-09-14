@@ -40,10 +40,18 @@ const PIPELINE_SLOTS: usize = 2;
 // Deliberately separate from `PIPELINE_SLOTS`: that constant also sizes the non-GDS scan pipeline
 // (`scan_transform_batches`) and the artifact-append channel shared by both paths, so widening it
 // would double buffers/queue capacity for the CPU path too. This one only sizes the GDS prefetch
-// pipeline's device-buffer slots (see `run_gds_prefetch_pipeline`) -- see
-// `profiling/GDS_PORTING_PLAN.md` for why 2 wasn't enough to consistently hide the read behind the
-// transform.
-const GDS_PIPELINE_SLOTS: usize = 4;
+// pipeline's device-buffer slots (see `run_gds_prefetch_pipeline`).
+//
+// Kept at 2 (exactly enough for double-buffering: one fragment's read running in the background,
+// one being transformed) rather than widened further -- kvikio's read concurrency comes from its
+// own single *global* thread pool (`KVIKIO_NTHREADS`, shared by every `cuvsReadLargeFile` call
+// process-wide, not per-call), so having more than one of our own fragment reads in flight doesn't
+// add capacity, it just adds contention for that same pool. Widening this to 4 was tried and made
+// aggregate wait time worse for the slot that ended up last in the round-robin, not better -- see
+// `profiling/GDS_PORTING_PLAN.md`. If GDS reads are ever given their own dedicated thread pool
+// (via `pread`'s `thread_pool` parameter) this constraint goes away and deeper pipelining could be
+// revisited independently of `PIPELINE_SLOTS`.
+const GDS_PIPELINE_SLOTS: usize = 2;
 const DEFAULT_SCAN_FRAGMENT_READAHEAD: usize = 0;
 const DEFAULT_SCAN_IO_BUFFER_SIZE: u64 = 16 * 1024 * 1024 * 1024;
 const DEFAULT_SCAN_BATCH_READAHEAD: usize = 32;
