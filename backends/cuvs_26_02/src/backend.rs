@@ -33,6 +33,32 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// RAII wrapper around `nvtx::range_push!`/`range_pop!`.
+///
+/// `nvtx`'s push/pop are nested and thread-local (they wrap legacy
+/// `nvtxRangePushA`/`nvtxRangePop`), so this guard is only safe for spans
+/// that run start-to-finish on one thread with no `.await` in between --
+/// pushing on one thread and popping after resuming on a different Tokio
+/// worker thread would corrupt that thread's NVTX stack. Use this only for
+/// synchronous code; it still correctly closes the range on early return via
+/// `?`, unlike calling the macros directly. Spans that cross an `.await` are
+/// left uninstrumented by NVTX and rely on the existing `Duration` timers
+/// instead.
+struct NvtxSpan;
+
+impl NvtxSpan {
+    fn new(message: &str) -> Self {
+        nvtx::range_push!(message);
+        Self
+    }
+}
+
+impl Drop for NvtxSpan {
+    fn drop(&mut self) {
+        nvtx::range_pop!();
+    }
+}
+
 const PARTITION_ARTIFACT_METADATA_FILE_NAME: &str = "metadata.lance";
 const PIPELINE_SLOTS: usize = 2;
 const DEFAULT_SCAN_FRAGMENT_READAHEAD: usize = 0;
@@ -476,11 +502,8 @@ impl TransformSlot {
         stream: cuvs_sys::cudaStream_t,
         prepared: PreparedTransformBatch,
     ) -> Result<LaunchTimings> {
-        // Fully synchronous (no `.await` inside), so nested push/pop is safe here.
-        nvtx::range_push("cuvs/gpu_launch");
-        let result = self.launch_inner(trained, stream, prepared);
-        nvtx::range_pop();
-        result
+        let _span = NvtxSpan::new("cuvs/gpu_launch");
+        self.launch_inner(trained, stream, prepared)
     }
 
     fn launch_inner(
@@ -552,11 +575,11 @@ impl TransformSlot {
             return Ok(None);
         }
 
-        let sync_range = nvtx::Range::new("cuvs/gpu_sync");
+        let sync_span = NvtxSpan::new("cuvs/gpu_sync");
         let sync_start = Instant::now();
         self.output_ready.synchronize()?;
         let sync = sync_start.elapsed();
-        drop(sync_range);
+        drop(sync_span);
         let h2d = self.h2d_done.elapsed_since(&self.h2d_start)?;
         let transform = self.transform_done.elapsed_since(&self.h2d_done)?;
         let d2h = self.output_ready.elapsed_since(&self.transform_done)?;
@@ -888,31 +911,27 @@ async fn scan_transform_batches(
     let mut stream = scanner.try_into_stream().await?;
     let mut stats = ArtifactScannerStats::default();
 
+    // No NVTX here: these spans cross an `.await`, and `nvtx`'s push/pop
+    // (the only ranges this crate version exposes) are nested/thread-local --
+    // a multi-threaded Tokio runtime may resume the task on a different
+    // worker thread and corrupt that thread's NVTX stack. The `Duration`
+    // accumulators below are the source of truth for this stage's timing.
     loop {
-        // `Range` (start/end) rather than `range_push`/`range_pop` (nested,
-        // thread-local): these spans cross an `.await`, and a multi-threaded
-        // Tokio runtime may resume the task on a different worker thread,
-        // which would corrupt a thread-local push/pop stack.
-        let scan_range = nvtx::Range::new(format!("cuvs/scan[{}]", stats.input_batches));
         let scan_start = Instant::now();
         let Some(batch) = stream.try_next().await? else {
             stats.scan_wait += scan_start.elapsed();
-            drop(scan_range);
             break;
         };
         stats.scan_wait += scan_start.elapsed();
         stats.input_batches += 1;
         stats.input_rows += batch.num_rows();
-        drop(scan_range);
 
-        let send_range = nvtx::Range::new(format!("cuvs/scan_send[{}]", stats.input_batches));
         let send_start = Instant::now();
         raw_tx
             .send(batch)
             .await
             .map_err(|error| Error::io(format!("failed to forward raw batch: {error}")))?;
         stats.send += send_start.elapsed();
-        drop(send_range);
     }
 
     Ok(stats)
@@ -927,29 +946,30 @@ fn prepare_transform_batch(
     stats.input_batches += 1;
     stats.input_rows += batch.num_rows();
 
-    // `Range` (start/end), not `range_push`/`range_pop`: this function
+    // `NvtxSpan` rather than raw `range_push!`/`range_pop!`: this function
     // returns early via `?` on malformed input, and it reruns on a reused
     // `spawn_blocking` thread across batches -- an unbalanced push/pop pair
     // would silently corrupt that thread's NVTX stack for every later batch.
-    // `Range`'s `Drop` closes the range unconditionally, so it's safe across
-    // any exit path.
-    let vector_range = nvtx::Range::new("cuvs/prepare_vector");
+    // `NvtxSpan`'s `Drop` closes the range unconditionally, so it's safe
+    // across any exit path (it never crosses an `.await`, so the thread
+    // stays fixed for the whole span).
+    let vector_span = NvtxSpan::new("cuvs/prepare_vector");
     let vector_start = Instant::now();
     let vectors = vector_column_to_fsl(&batch, column)?;
     let row_ids = batch
         .column_by_name(ROW_ID)
         .ok_or_else(|| Error::invalid_input(format!("transform batch is missing {ROW_ID}")))?;
     stats.vector += vector_start.elapsed();
-    drop(vector_range);
+    drop(vector_span);
 
-    let filter_range = nvtx::Range::new("cuvs/prepare_filter");
+    let filter_span = NvtxSpan::new("cuvs/prepare_filter");
     let filter_start = Instant::now();
     let (filtered_row_ids, filtered_vectors) = if filter_nan {
         let finite_mask = is_finite(&vectors);
         let valid_rows = finite_mask.true_count();
         if valid_rows == 0 {
             stats.filter += filter_start.elapsed();
-            drop(filter_range);
+            drop(filter_span);
             return Ok(None);
         }
         if valid_rows != vectors.len() {
@@ -995,15 +1015,15 @@ fn prepare_transform_batch(
         (row_ids.clone(), vectors)
     };
     stats.filter += filter_start.elapsed();
-    drop(filter_range);
+    drop(filter_span);
 
-    let matrix_range = nvtx::Range::new("cuvs/prepare_matrix");
+    let matrix_span = NvtxSpan::new("cuvs/prepare_matrix");
     let matrix_start = Instant::now();
     let matrix = matrix_from_vectors(&filtered_vectors)?;
     stats.matrix += matrix_start.elapsed();
-    drop(matrix_range);
+    drop(matrix_span);
 
-    let register_range = nvtx::Range::new("cuvs/prepare_register");
+    let register_span = NvtxSpan::new("cuvs/prepare_register");
     let (prepared_matrix, input_registration) = match matrix {
         MatrixBuffer::Borrowed { values, rows, cols } => {
             let register_start = Instant::now();
@@ -1032,7 +1052,7 @@ fn prepare_transform_batch(
         }
         MatrixBuffer::Owned(array) => (PreparedMatrix::Owned(array), None),
     };
-    drop(register_range);
+    drop(register_span);
 
     Ok(Some(PreparedTransformBatch {
         row_ids: filtered_row_ids,
@@ -1052,22 +1072,18 @@ async fn prepare_transform_batches(
         ..Default::default()
     };
 
-    let mut batch_index = 0usize;
     loop {
-        let raw_wait_range = nvtx::Range::new(format!("cuvs/prepare_raw_wait[{batch_index}]"));
         let raw_wait_start = Instant::now();
         let batch = {
             let mut raw_rx = raw_rx.lock().await;
             raw_rx.next().await
         };
         stats.raw_wait += raw_wait_start.elapsed();
-        drop(raw_wait_range);
 
         let Some(batch) = batch else {
             break;
         };
         let column = column.clone();
-        let prepare_range = nvtx::Range::new(format!("cuvs/prepare_blocking[{batch_index}]"));
         let (prepared, batch_stats) = tokio::task::spawn_blocking(move || {
             let mut batch_stats = ArtifactPrepareStats::default();
             let prepared = prepare_transform_batch(batch, &column, filter_nan, &mut batch_stats)?;
@@ -1075,7 +1091,6 @@ async fn prepare_transform_batches(
         })
         .await
         .map_err(|error| Error::io(format!("prepare transform blocking task failed: {error}")))??;
-        drop(prepare_range);
         stats.input_batches += batch_stats.input_batches;
         stats.input_rows += batch_stats.input_rows;
         stats.vector += batch_stats.vector;
@@ -1083,19 +1098,16 @@ async fn prepare_transform_batches(
         stats.matrix += batch_stats.matrix;
         stats.register += batch_stats.register;
         stats.registered_bytes += batch_stats.registered_bytes;
-        batch_index += 1;
 
         let Some(prepared) = prepared else {
             continue;
         };
-        let send_range = nvtx::Range::new(format!("cuvs/prepare_send[{batch_index}]"));
         let send_start = Instant::now();
         prepared_tx
             .send(prepared)
             .await
             .map_err(|error| Error::io(format!("failed to forward prepared batch: {error}")))?;
         stats.send += send_start.elapsed();
-        drop(send_range);
     }
 
     Ok(stats)
@@ -1230,11 +1242,9 @@ async fn append_artifact_batches(
     let mut recv_wait = Duration::default();
     let mut append_time = Duration::default();
     loop {
-        let recv_range = nvtx::Range::new(format!("cuvs/append_recv_wait[{batches}]"));
         let recv_start = Instant::now();
         let batch = rx.next().await;
         recv_wait += recv_start.elapsed();
-        drop(recv_range);
 
         let Some(batch) = batch else {
             break;
@@ -1243,11 +1253,9 @@ async fn append_artifact_batches(
         batches += 1;
         rows += batch.num_rows();
 
-        let append_range = nvtx::Range::new(format!("cuvs/append_write[{batches}]"));
         let append_start = Instant::now();
         artifact.append_batch(&batch).await?;
         append_time += append_start.elapsed();
-        drop(append_range);
     }
 
     let finish_start = Instant::now();
