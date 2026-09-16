@@ -48,7 +48,7 @@ struct NvtxSpan;
 
 impl NvtxSpan {
     fn new(message: &str) -> Self {
-        nvtx::range_push!(message);
+        nvtx::range_push!("{}", message);
         Self
     }
 }
