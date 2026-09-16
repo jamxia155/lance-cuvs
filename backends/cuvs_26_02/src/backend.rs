@@ -1536,9 +1536,26 @@ pub async fn assign_ivf_pq_to_artifact(
         &mut append_tx,
     )
     .await;
+    // Capture elapsed time before `cuda_profiler_stop()`, not after: under
+    // nsys with `--capture-range-end=stop`, stopping capture triggers a
+    // blocking trace export inside that call, and its duration scales with
+    // trace size (observed: ~3s for a small trace, ~17s for one bloated by
+    // millions of CUPTI_ACTIVITY_KIND_SYNCHRONIZATION rows from RMM pool
+    // instrumentation). Measuring after `cuda_profiler_stop()` would
+    // silently fold that nsys-internal export time into a number that's
+    // supposed to be pure pipeline wall clock.
+    let append_elapsed = append_start.elapsed();
     drop(append_tx);
+    let stop_start = Instant::now();
     if let Err(stop_error) = cuda_profiler_stop() {
         warn!("failed to stop CUDA profiler capture: {stop_error}");
+    }
+    let stop_elapsed = stop_start.elapsed();
+    if stop_elapsed > Duration::from_millis(100) {
+        eprintln!(
+            "cuVS cuda_profiler_stop time: {:.3}s (likely nsys trace export, not pipeline work)",
+            stop_elapsed.as_secs_f64()
+        );
     }
     if let Err(error) = append_result {
         append_task.abort();
@@ -1546,7 +1563,7 @@ pub async fn assign_ivf_pq_to_artifact(
     }
     eprintln!(
         "cuVS artifact append_transformed_batches time: {:.3}s",
-        append_start.elapsed().as_secs_f64()
+        append_elapsed.as_secs_f64()
     );
     let files = append_task
         .await
