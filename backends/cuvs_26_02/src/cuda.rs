@@ -44,6 +44,19 @@ unsafe extern "C" {
         start: CudaEventHandle,
         end: CudaEventHandle,
     ) -> cuvs_sys::cudaError_t;
+    fn cudaProfilerStart() -> cuvs_sys::cudaError_t;
+    fn cudaProfilerStop() -> cuvs_sys::cudaError_t;
+}
+
+/// Start `nsys`/`nvprof` capture when run under `--capture-range=cudaProfilerApi`.
+/// A no-op outside that mode.
+pub(crate) fn cuda_profiler_start() -> Result<()> {
+    check_cuda(unsafe { cudaProfilerStart() }, "start CUDA profiler capture")
+}
+
+/// Stop `nsys`/`nvprof` capture started by [`cuda_profiler_start`].
+pub(crate) fn cuda_profiler_stop() -> Result<()> {
+    check_cuda(unsafe { cudaProfilerStop() }, "stop CUDA profiler capture")
 }
 
 pub(crate) struct CuvsIvfPqIndex {

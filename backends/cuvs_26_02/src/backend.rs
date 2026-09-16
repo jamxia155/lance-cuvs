@@ -4,8 +4,9 @@
 use crate::cuda::{
     CudaEvent, CuvsIvfPqIndex, DeviceTensor, HostTensorView, MatrixBuffer, PinnedHostBuffer,
     RegisteredHostBuffer, check_cuvs, copy_tensor_to_host_f32_2d, copy_tensor_to_host_f32_3d,
-    create_index_params, destroy_index_params, enable_rmm_pool_from_env, ivf_centroids_from_host,
-    make_tensor_view, matrix_from_vectors, pq_codebook_from_host,
+    create_index_params, cuda_profiler_start, cuda_profiler_stop, destroy_index_params,
+    enable_rmm_pool_from_env, ivf_centroids_from_host, make_tensor_view, matrix_from_vectors,
+    pq_codebook_from_host,
 };
 use arrow::compute::{concat_batches, filter};
 use arrow_array::cast::AsArray;
@@ -475,6 +476,19 @@ impl TransformSlot {
         stream: cuvs_sys::cudaStream_t,
         prepared: PreparedTransformBatch,
     ) -> Result<LaunchTimings> {
+        // Fully synchronous (no `.await` inside), so nested push/pop is safe here.
+        nvtx::range_push("cuvs/gpu_launch");
+        let result = self.launch_inner(trained, stream, prepared);
+        nvtx::range_pop();
+        result
+    }
+
+    fn launch_inner(
+        &mut self,
+        trained: &TrainedIvfPqIndex,
+        stream: cuvs_sys::cudaStream_t,
+        prepared: PreparedTransformBatch,
+    ) -> Result<LaunchTimings> {
         let mut timings = LaunchTimings::default();
         let code_width = trained.pq_code_width();
         let row_ids = prepared.row_ids;
@@ -538,9 +552,11 @@ impl TransformSlot {
             return Ok(None);
         }
 
+        let sync_range = nvtx::Range::new("cuvs/gpu_sync");
         let sync_start = Instant::now();
         self.output_ready.synchronize()?;
         let sync = sync_start.elapsed();
+        drop(sync_range);
         let h2d = self.h2d_done.elapsed_since(&self.h2d_start)?;
         let transform = self.transform_done.elapsed_since(&self.h2d_done)?;
         let d2h = self.output_ready.elapsed_since(&self.transform_done)?;
@@ -873,21 +889,30 @@ async fn scan_transform_batches(
     let mut stats = ArtifactScannerStats::default();
 
     loop {
+        // `Range` (start/end) rather than `range_push`/`range_pop` (nested,
+        // thread-local): these spans cross an `.await`, and a multi-threaded
+        // Tokio runtime may resume the task on a different worker thread,
+        // which would corrupt a thread-local push/pop stack.
+        let scan_range = nvtx::Range::new(format!("cuvs/scan[{}]", stats.input_batches));
         let scan_start = Instant::now();
         let Some(batch) = stream.try_next().await? else {
             stats.scan_wait += scan_start.elapsed();
+            drop(scan_range);
             break;
         };
         stats.scan_wait += scan_start.elapsed();
         stats.input_batches += 1;
         stats.input_rows += batch.num_rows();
+        drop(scan_range);
 
+        let send_range = nvtx::Range::new(format!("cuvs/scan_send[{}]", stats.input_batches));
         let send_start = Instant::now();
         raw_tx
             .send(batch)
             .await
             .map_err(|error| Error::io(format!("failed to forward raw batch: {error}")))?;
         stats.send += send_start.elapsed();
+        drop(send_range);
     }
 
     Ok(stats)
@@ -902,19 +927,29 @@ fn prepare_transform_batch(
     stats.input_batches += 1;
     stats.input_rows += batch.num_rows();
 
+    // `Range` (start/end), not `range_push`/`range_pop`: this function
+    // returns early via `?` on malformed input, and it reruns on a reused
+    // `spawn_blocking` thread across batches -- an unbalanced push/pop pair
+    // would silently corrupt that thread's NVTX stack for every later batch.
+    // `Range`'s `Drop` closes the range unconditionally, so it's safe across
+    // any exit path.
+    let vector_range = nvtx::Range::new("cuvs/prepare_vector");
     let vector_start = Instant::now();
     let vectors = vector_column_to_fsl(&batch, column)?;
     let row_ids = batch
         .column_by_name(ROW_ID)
         .ok_or_else(|| Error::invalid_input(format!("transform batch is missing {ROW_ID}")))?;
     stats.vector += vector_start.elapsed();
+    drop(vector_range);
 
+    let filter_range = nvtx::Range::new("cuvs/prepare_filter");
     let filter_start = Instant::now();
     let (filtered_row_ids, filtered_vectors) = if filter_nan {
         let finite_mask = is_finite(&vectors);
         let valid_rows = finite_mask.true_count();
         if valid_rows == 0 {
             stats.filter += filter_start.elapsed();
+            drop(filter_range);
             return Ok(None);
         }
         if valid_rows != vectors.len() {
@@ -960,11 +995,15 @@ fn prepare_transform_batch(
         (row_ids.clone(), vectors)
     };
     stats.filter += filter_start.elapsed();
+    drop(filter_range);
 
+    let matrix_range = nvtx::Range::new("cuvs/prepare_matrix");
     let matrix_start = Instant::now();
     let matrix = matrix_from_vectors(&filtered_vectors)?;
     stats.matrix += matrix_start.elapsed();
+    drop(matrix_range);
 
+    let register_range = nvtx::Range::new("cuvs/prepare_register");
     let (prepared_matrix, input_registration) = match matrix {
         MatrixBuffer::Borrowed { values, rows, cols } => {
             let register_start = Instant::now();
@@ -993,6 +1032,7 @@ fn prepare_transform_batch(
         }
         MatrixBuffer::Owned(array) => (PreparedMatrix::Owned(array), None),
     };
+    drop(register_range);
 
     Ok(Some(PreparedTransformBatch {
         row_ids: filtered_row_ids,
@@ -1012,18 +1052,22 @@ async fn prepare_transform_batches(
         ..Default::default()
     };
 
+    let mut batch_index = 0usize;
     loop {
+        let raw_wait_range = nvtx::Range::new(format!("cuvs/prepare_raw_wait[{batch_index}]"));
         let raw_wait_start = Instant::now();
         let batch = {
             let mut raw_rx = raw_rx.lock().await;
             raw_rx.next().await
         };
         stats.raw_wait += raw_wait_start.elapsed();
+        drop(raw_wait_range);
 
         let Some(batch) = batch else {
             break;
         };
         let column = column.clone();
+        let prepare_range = nvtx::Range::new(format!("cuvs/prepare_blocking[{batch_index}]"));
         let (prepared, batch_stats) = tokio::task::spawn_blocking(move || {
             let mut batch_stats = ArtifactPrepareStats::default();
             let prepared = prepare_transform_batch(batch, &column, filter_nan, &mut batch_stats)?;
@@ -1031,6 +1075,7 @@ async fn prepare_transform_batches(
         })
         .await
         .map_err(|error| Error::io(format!("prepare transform blocking task failed: {error}")))??;
+        drop(prepare_range);
         stats.input_batches += batch_stats.input_batches;
         stats.input_rows += batch_stats.input_rows;
         stats.vector += batch_stats.vector;
@@ -1038,16 +1083,19 @@ async fn prepare_transform_batches(
         stats.matrix += batch_stats.matrix;
         stats.register += batch_stats.register;
         stats.registered_bytes += batch_stats.registered_bytes;
+        batch_index += 1;
 
         let Some(prepared) = prepared else {
             continue;
         };
+        let send_range = nvtx::Range::new(format!("cuvs/prepare_send[{batch_index}]"));
         let send_start = Instant::now();
         prepared_tx
             .send(prepared)
             .await
             .map_err(|error| Error::io(format!("failed to forward prepared batch: {error}")))?;
         stats.send += send_start.elapsed();
+        drop(send_range);
     }
 
     Ok(stats)
@@ -1174,14 +1222,32 @@ async fn append_artifact_batches(
 ) -> Result<Vec<String>> {
     let mut batches = 0usize;
     let mut rows = 0usize;
+    // Idle time waiting for the GPU pipeline to hand off a finished batch --
+    // the mirror of `raw_wait`/`scan_wait` upstream. Previously unmeasured:
+    // only time spent inside `append_batch` itself was logged, so there was
+    // no way to tell "append is the bottleneck" from "append is idle,
+    // starved by GPU/scan/prepare upstream" just from the existing timers.
+    let mut recv_wait = Duration::default();
     let mut append_time = Duration::default();
-    while let Some(batch) = rx.next().await {
+    loop {
+        let recv_range = nvtx::Range::new(format!("cuvs/append_recv_wait[{batches}]"));
+        let recv_start = Instant::now();
+        let batch = rx.next().await;
+        recv_wait += recv_start.elapsed();
+        drop(recv_range);
+
+        let Some(batch) = batch else {
+            break;
+        };
         let batch = batch?;
         batches += 1;
         rows += batch.num_rows();
+
+        let append_range = nvtx::Range::new(format!("cuvs/append_write[{batches}]"));
         let append_start = Instant::now();
         artifact.append_batch(&batch).await?;
         append_time += append_start.elapsed();
+        drop(append_range);
     }
 
     let finish_start = Instant::now();
@@ -1190,9 +1256,10 @@ async fn append_artifact_batches(
         .await?;
     let finish_time = finish_start.elapsed();
     eprintln!(
-        "cuVS artifact append task: batches={} rows={} append_s={:.3} finish_s={:.3} files={}",
+        "cuVS artifact append task: batches={} rows={} recv_wait_s={:.3} append_s={:.3} finish_s={:.3} files={}",
         batches,
         rows,
+        secs(recv_wait),
         secs(append_time),
         secs(finish_time),
         files.len()
@@ -1267,6 +1334,7 @@ pub async fn train_ivf_pq(
         sample_start.elapsed().as_secs_f64(),
         train_vectors.len()
     );
+    let filter_start = Instant::now();
     let train_vectors = if filter_nan {
         let mask = is_finite(&train_vectors);
         let filtered = filter(&train_vectors, &mask)?.as_fixed_size_list().clone();
@@ -1279,8 +1347,17 @@ pub async fn train_ivf_pq(
             "cuVS training requires at least one non-null training vector",
         ));
     }
+    eprintln!(
+        "cuVS train sample filter time: {:.3}s",
+        filter_start.elapsed().as_secs_f64()
+    );
 
+    let matrix_start = Instant::now();
     let matrix = matrix_from_vectors(&train_vectors)?;
+    eprintln!(
+        "cuVS train sample matrix time: {:.3}s",
+        matrix_start.elapsed().as_secs_f64()
+    );
     enable_rmm_pool_from_env()?;
     let resources = Resources::new().map_err(|error| Error::io(error.to_string()))?;
     let index = CuvsIvfPqIndex::try_new()?;
@@ -1298,6 +1375,12 @@ pub async fn train_ivf_pq(
         matrix_view.as_ptr() as *mut std::ffi::c_void,
     );
 
+    // `cuvsIvfPqBuild` runs k-means clustering plus PQ codebook training on
+    // the GPU and, unlike the transform path, is not broken up into
+    // enqueue-vs-sync phases here -- this wall-clock duration is the
+    // straightforward ground truth for "how long did training actually
+    // take on the GPU," not just an enqueue cost.
+    let build_start = Instant::now();
     let build_result = check_cuvs(
         unsafe {
             cuvs_sys::cuvsIvfPqBuild(resources.0, params, dataset_tensor.as_mut_ptr(), index.raw)
@@ -1306,7 +1389,16 @@ pub async fn train_ivf_pq(
     );
     destroy_index_params(params);
     build_result?;
+    eprintln!(
+        "cuVS cuvsIvfPqBuild time: {:.3}s",
+        build_start.elapsed().as_secs_f64()
+    );
 
+    // `copy_tensor_to_host_f32_2d`/`_3d` each end with a blocking
+    // `resources.sync_stream()`, so these durations also absorb any
+    // outstanding GPU work queued by `cuvsIvfPqBuild` that hadn't finished
+    // by the time the build call returned.
+    let centroid_readback_start = Instant::now();
     let mut centers = make_tensor_view();
     check_cuvs(
         unsafe { cuvs_sys::cuvsIvfPqIndexGetCenters(index.raw, centers.as_mut_ptr()) },
@@ -1314,7 +1406,12 @@ pub async fn train_ivf_pq(
     )?;
     let ivf_centroids =
         ivf_centroids_from_host(copy_tensor_to_host_f32_2d(&resources, centers.tensor())?)?;
+    eprintln!(
+        "cuVS IVF centroid readback time: {:.3}s",
+        centroid_readback_start.elapsed().as_secs_f64()
+    );
 
+    let codebook_readback_start = Instant::now();
     let mut pq_centers = make_tensor_view();
     check_cuvs(
         unsafe { cuvs_sys::cuvsIvfPqIndexGetPqCenters(index.raw, pq_centers.as_mut_ptr()) },
@@ -1329,6 +1426,10 @@ pub async fn train_ivf_pq(
         dimension,
         num_bits,
     )?;
+    eprintln!(
+        "cuVS PQ codebook readback time: {:.3}s",
+        codebook_readback_start.elapsed().as_secs_f64()
+    );
 
     Ok(TrainedIvfPqIndex {
         resources,
@@ -1393,6 +1494,7 @@ pub async fn assign_ivf_pq_to_artifact(
     filter_nan: bool,
     storage_options: Option<&HashMap<String, String>>,
 ) -> Result<Vec<String>> {
+    let builder_start = Instant::now();
     let artifact = PartitionArtifactBuilder::try_new(
         artifact_uri,
         trained.num_partitions,
@@ -1400,10 +1502,22 @@ pub async fn assign_ivf_pq_to_artifact(
         storage_options,
     )
     .await?;
+    eprintln!(
+        "cuVS artifact builder setup time: {:.3}s",
+        builder_start.elapsed().as_secs_f64()
+    );
 
     let (mut append_tx, append_rx) = mpsc::channel::<Result<RecordBatch>>(PIPELINE_SLOTS);
     let append_task = tokio::spawn(append_artifact_batches(artifact, append_rx));
 
+    // Scope nsys/nvprof capture (when run with `--capture-range=cudaProfilerApi`)
+    // to the transform/append pipeline, excluding the separately-timed k-means
+    // training phase that precedes this function.
+    if let Err(error) = cuda_profiler_start() {
+        drop(append_tx);
+        append_task.abort();
+        return Err(error);
+    }
     let append_start = Instant::now();
     let append_result = append_transformed_batches_to_artifact(
         dataset,
@@ -1415,6 +1529,9 @@ pub async fn assign_ivf_pq_to_artifact(
     )
     .await;
     drop(append_tx);
+    if let Err(stop_error) = cuda_profiler_stop() {
+        warn!("failed to stop CUDA profiler capture: {stop_error}");
+    }
     if let Err(error) = append_result {
         append_task.abort();
         return Err(error);
