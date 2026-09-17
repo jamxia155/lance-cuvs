@@ -1362,8 +1362,13 @@ pub async fn train_ivf_pq(
     }
 
     let train_rows = (num_partitions * sample_rate).max(256 * 256).max(1);
+    // Instant markers, not a push/pop range: this call crosses an `.await`,
+    // and a multi-threaded Tokio runtime may resume the task on a different
+    // worker thread, which would corrupt a thread-local push/pop stack.
+    nvtx::mark!("cuvs/sample_training_vectors_start");
     let sample_start = Instant::now();
     let train_vectors = sample_training_vectors(dataset, column, train_rows).await?;
+    nvtx::mark!("cuvs/sample_training_vectors_end");
     eprintln!(
         "cuVS train sample time: {:.3}s rows={}",
         sample_start.elapsed().as_secs_f64(),
