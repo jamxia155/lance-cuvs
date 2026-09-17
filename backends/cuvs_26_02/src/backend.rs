@@ -435,6 +435,7 @@ struct DrainedTransformBatch {
     transform: Duration,
     d2h: Duration,
     sync: Duration,
+    event_query: Duration,
     build_batch: Duration,
 }
 
@@ -580,9 +581,17 @@ impl TransformSlot {
         self.output_ready.synchronize()?;
         let sync = sync_start.elapsed();
         drop(sync_span);
+        // `drain_s` previously didn't add up to `sync_s + build_batch_s` (off
+        // by ~2.7-3.1s per run, consistently) -- this is the suspected culprit:
+        // three separate `cudaEventElapsedTime` driver calls, each with its
+        // own real (if individually small) call overhead.
+        let event_query_span = NvtxSpan::new("cuvs/gpu_event_query");
+        let event_query_start = Instant::now();
         let h2d = self.h2d_done.elapsed_since(&self.h2d_start)?;
         let transform = self.transform_done.elapsed_since(&self.h2d_done)?;
         let d2h = self.output_ready.elapsed_since(&self.transform_done)?;
+        let event_query = event_query_start.elapsed();
+        drop(event_query_span);
         self.input_registration = None;
         self.input_vectors = None;
         self.input_matrix = None;
@@ -605,6 +614,7 @@ impl TransformSlot {
             transform,
             d2h,
             sync,
+            event_query,
             build_batch,
         }))
     }
@@ -672,6 +682,7 @@ struct ArtifactBuildStats {
     launch_transform_call_first_max: FirstMaxTracker,
     launch_d2h_enqueue_first_max: FirstMaxTracker,
     drain_sync: Duration,
+    drain_event_query: Duration,
     drain_build_batch: Duration,
     register: Duration,
     registered_bytes: usize,
@@ -713,6 +724,7 @@ impl ArtifactBuildStats {
         self.gpu_transform_first_max.record(drained.transform);
         self.gpu_d2h_first_max.record(drained.d2h);
         self.drain_sync += drained.sync;
+        self.drain_event_query += drained.event_query;
         self.drain_build_batch += drained.build_batch;
     }
 
@@ -785,8 +797,9 @@ impl ArtifactBuildStats {
             self.launch_d2h_enqueue_first_max.max_secs(),
         );
         eprintln!(
-            "cuVS artifact drain cpu: sync_s={:.3} build_batch_s={:.3}",
+            "cuVS artifact drain cpu: sync_s={:.3} event_query_s={:.3} build_batch_s={:.3}",
             secs(self.drain_sync),
+            secs(self.drain_event_query),
             secs(self.drain_build_batch),
         );
         eprintln!("cuVS artifact max rss: {} KiB", max_rss_kib());
