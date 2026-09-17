@@ -436,6 +436,7 @@ struct DrainedTransformBatch {
     d2h: Duration,
     sync: Duration,
     event_query: Duration,
+    release: Duration,
     build_batch: Duration,
 }
 
@@ -592,9 +593,18 @@ impl TransformSlot {
         let d2h = self.output_ready.elapsed_since(&self.transform_done)?;
         let event_query = event_query_start.elapsed();
         drop(event_query_span);
+        // event_query_s turned out negligible (~0.001s/run), not the culprit
+        // for drain_s's gap. This line drops `input_registration`
+        // (`RegisteredHostBuffer`, whose `Drop` calls `cudaHostUnregister` --
+        // confirmed non-trivial in an earlier CUDA-API trace, ~620ms/64
+        // calls there) plus the input vectors/matrix buffers themselves.
+        let release_span = NvtxSpan::new("cuvs/gpu_release_input");
+        let release_start = Instant::now();
         self.input_registration = None;
         self.input_vectors = None;
         self.input_matrix = None;
+        let release = release_start.elapsed();
+        drop(release_span);
         let row_ids = self
             .row_ids
             .take()
@@ -615,6 +625,7 @@ impl TransformSlot {
             d2h,
             sync,
             event_query,
+            release,
             build_batch,
         }))
     }
@@ -683,6 +694,7 @@ struct ArtifactBuildStats {
     launch_d2h_enqueue_first_max: FirstMaxTracker,
     drain_sync: Duration,
     drain_event_query: Duration,
+    drain_release: Duration,
     drain_build_batch: Duration,
     register: Duration,
     registered_bytes: usize,
@@ -725,6 +737,7 @@ impl ArtifactBuildStats {
         self.gpu_d2h_first_max.record(drained.d2h);
         self.drain_sync += drained.sync;
         self.drain_event_query += drained.event_query;
+        self.drain_release += drained.release;
         self.drain_build_batch += drained.build_batch;
     }
 
@@ -797,9 +810,10 @@ impl ArtifactBuildStats {
             self.launch_d2h_enqueue_first_max.max_secs(),
         );
         eprintln!(
-            "cuVS artifact drain cpu: sync_s={:.3} event_query_s={:.3} build_batch_s={:.3}",
+            "cuVS artifact drain cpu: sync_s={:.3} event_query_s={:.3} release_s={:.3} build_batch_s={:.3}",
             secs(self.drain_sync),
             secs(self.drain_event_query),
+            secs(self.drain_release),
             secs(self.drain_build_batch),
         );
         eprintln!("cuVS artifact max rss: {} KiB", max_rss_kib());
