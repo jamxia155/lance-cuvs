@@ -903,13 +903,31 @@ async fn sample_training_vectors(
         projection,
         TRAINING_SAMPLE_BATCH_READAHEAD,
     );
+    // Instant markers (not a push/pop range): crosses an `.await`, and a
+    // multi-threaded Tokio runtime may resume the task on a different
+    // worker thread, which would corrupt a thread-local push/pop stack.
+    nvtx::mark!("cuvs/sample_collect_start");
+    let collect_start = Instant::now();
     let batches = stream.try_collect::<Vec<_>>().await?;
+    let collect = collect_start.elapsed();
+    nvtx::mark!("cuvs/sample_collect_end");
     let Some(schema) = batches.first().map(RecordBatch::schema) else {
         return Err(Error::invalid_input(
             "cuVS training sample did not return any vectors",
         ));
     };
+    // Fully synchronous (no `.await` inside), so a push/pop range is safe here.
+    let concat_span = NvtxSpan::new("cuvs/sample_concat");
+    let concat_start = Instant::now();
     let batch = concat_batches(&schema, &batches)?;
+    let concat = concat_start.elapsed();
+    drop(concat_span);
+    eprintln!(
+        "cuVS train sample collect/concat: collect_s={:.3} concat_s={:.3} batches={}",
+        collect.as_secs_f64(),
+        concat.as_secs_f64(),
+        batches.len(),
+    );
     Ok(vector_column_to_fsl(&batch, column)?)
 }
 
