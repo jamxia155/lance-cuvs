@@ -69,12 +69,12 @@ const DEFAULT_SCAN_BATCH_READAHEAD: usize = 32;
 const DEFAULT_PREPARE_WORKERS: usize = 1;
 const TRAINING_SAMPLE_CHUNK_ROWS: usize = 8 * 1024;
 const TRAINING_SAMPLE_BATCH_READAHEAD: usize = 64;
-// Conservative, fixed thread count for prefaulting the training-sample
+// Conservative default thread count for prefaulting the training-sample
 // buffer -- deliberately not scaled to all available cores, so it doesn't
 // contend with the scan/decode pipeline's own concurrency (already
 // observed using ~35 threads for concurrent reads) while it runs alongside
-// it in the background.
-const SAMPLE_PREFAULT_THREADS: usize = 8;
+// it in the background. Overridable via LANCE_CUVS_SAMPLE_PREFAULT_THREADS.
+const DEFAULT_SAMPLE_PREFAULT_THREADS: usize = 8;
 
 /// A trained cuVS IVF_PQ model that can be reused for artifact builds.
 ///
@@ -850,6 +850,14 @@ fn prepare_workers_from_env() -> usize {
         .unwrap_or(DEFAULT_PREPARE_WORKERS)
 }
 
+fn sample_prefault_threads_from_env() -> usize {
+    std::env::var("LANCE_CUVS_SAMPLE_PREFAULT_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or(DEFAULT_SAMPLE_PREFAULT_THREADS)
+}
+
 fn scan_fragment_readahead_from_env() -> usize {
     std::env::var("LANCE_CUVS_SCAN_FRAGMENT_READAHEAD")
         .ok()
@@ -931,7 +939,7 @@ async fn sample_training_vectors(
         nvtx::mark!("cuvs/sample_prefault_start");
         let mut buf = vec![0f32; expected_rows * dimension];
         if !buf.is_empty() {
-            let num_threads = SAMPLE_PREFAULT_THREADS.min(buf.len()).max(1);
+            let num_threads = sample_prefault_threads_from_env().min(buf.len()).max(1);
             let chunk_len = buf.len().div_ceil(num_threads);
             std::thread::scope(|scope| {
                 for chunk in buf.chunks_mut(chunk_len) {
