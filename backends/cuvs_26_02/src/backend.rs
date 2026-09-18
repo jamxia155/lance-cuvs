@@ -924,6 +924,17 @@ async fn sample_training_vectors(
     nvtx::mark!("cuvs/sample_collect_start");
     let collect_start = Instant::now();
     let mut sample_values = vec![0f32; expected_rows * dimension];
+    // `vec![0f32; N]` for a large N is typically backed by lazily-mapped,
+    // copy-on-write zero pages on Linux -- the *first* write to each page
+    // (which would otherwise happen inside the copy loop below) triggers a
+    // minor page fault to materialize real memory. Pre-fault everything
+    // up front, outside the region we're trying to measure/optimize, to
+    // test whether that's what's capping the copy loop's throughput.
+    let prefault_span = NvtxSpan::new("cuvs/sample_prefault");
+    let prefault_start = Instant::now();
+    sample_values.iter_mut().for_each(|v| *v = 0.0);
+    let prefault = prefault_start.elapsed();
+    drop(prefault_span);
     let mut copy_time = Duration::default();
     let mut offset_rows = 0usize;
     while let Some(batch) = stream.try_next().await? {
@@ -966,8 +977,9 @@ async fn sample_training_vectors(
     }
     sample_values.truncate(offset_rows * dimension);
     eprintln!(
-        "cuVS train sample collect: total_s={:.3} copy_s={:.3} rows={}",
+        "cuVS train sample collect: total_s={:.3} prefault_s={:.3} copy_s={:.3} rows={}",
         collect.as_secs_f64(),
+        prefault.as_secs_f64(),
         copy_time.as_secs_f64(),
         offset_rows,
     );
