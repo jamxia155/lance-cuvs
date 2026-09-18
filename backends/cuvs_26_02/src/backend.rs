@@ -69,6 +69,12 @@ const DEFAULT_SCAN_BATCH_READAHEAD: usize = 32;
 const DEFAULT_PREPARE_WORKERS: usize = 1;
 const TRAINING_SAMPLE_CHUNK_ROWS: usize = 8 * 1024;
 const TRAINING_SAMPLE_BATCH_READAHEAD: usize = 64;
+// Conservative, fixed thread count for prefaulting the training-sample
+// buffer -- deliberately not scaled to all available cores, so it doesn't
+// contend with the scan/decode pipeline's own concurrency (already
+// observed using ~35 threads for concurrent reads) while it runs alongside
+// it in the background.
+const SAMPLE_PREFAULT_THREADS: usize = 8;
 
 /// A trained cuVS IVF_PQ model that can be reused for artifact builds.
 ///
@@ -908,34 +914,43 @@ async fn sample_training_vectors(
         TRAINING_SAMPLE_BATCH_READAHEAD,
     );
 
-    // Copy each batch directly into one pre-allocated buffer as it arrives,
-    // instead of collecting all batches into a `Vec<RecordBatch>` and then
-    // running a separate `concat_batches` pass over them afterward.
-    // Profiling showed `concat_batches` ran at ~39% of this machine's
-    // measured single-threaded memcpy bandwidth (1.78 GB/s vs. 4.52 GB/s),
-    // and -- being a wholly separate pass after collection -- couldn't
-    // overlap with the scan/decode stream at all. A plain `copy_from_slice`
-    // per batch runs close to raw memcpy speed and happens incrementally as
-    // each batch is decoded rather than only after all of them arrive.
-    //
+    // Prefaulting the destination buffer (forcing its pages to be resident
+    // before writing into them) turned out to cost as much as the
+    // concat_batches pass it replaced (~4.4s, confirmed single-threaded via
+    // profiling) -- but unlike the scan below, that cost is pure CPU/memory
+    // work with no I/O wait, so it can run concurrently with the scan
+    // instead of serially before or interleaved into it. Farm it out to a
+    // background blocking task, parallelized across a few threads via
+    // `std::thread::scope` (safe to borrow the task-local buffer across
+    // threads because the scope blocks until they all finish), and collect
+    // decoded batches into `pending` in the meantime instead of copying
+    // them immediately -- `FixedSizeListArray` values are just Arc handles
+    // into Arrow's own already-allocated decode buffers, so holding onto a
+    // batch's worth of them briefly costs no extra data movement.
+    let prefault_handle = tokio::task::spawn_blocking(move || {
+        nvtx::mark!("cuvs/sample_prefault_start");
+        let mut buf = vec![0f32; expected_rows * dimension];
+        if !buf.is_empty() {
+            let num_threads = SAMPLE_PREFAULT_THREADS.min(buf.len()).max(1);
+            let chunk_len = buf.len().div_ceil(num_threads);
+            std::thread::scope(|scope| {
+                for chunk in buf.chunks_mut(chunk_len) {
+                    scope.spawn(move || {
+                        chunk.iter_mut().for_each(|v| *v = 0.0);
+                    });
+                }
+            });
+        }
+        nvtx::mark!("cuvs/sample_prefault_end");
+        buf
+    });
+
     // Instant markers (not a push/pop range): this loop crosses an `.await`,
     // and a multi-threaded Tokio runtime may resume the task on a different
     // worker thread, which would corrupt a thread-local push/pop stack.
     nvtx::mark!("cuvs/sample_collect_start");
     let collect_start = Instant::now();
-    let mut sample_values = vec![0f32; expected_rows * dimension];
-    // `vec![0f32; N]` for a large N is typically backed by lazily-mapped,
-    // copy-on-write zero pages on Linux -- the *first* write to each page
-    // (which would otherwise happen inside the copy loop below) triggers a
-    // minor page fault to materialize real memory. Pre-fault everything
-    // up front, outside the region we're trying to measure/optimize, to
-    // test whether that's what's capping the copy loop's throughput.
-    let prefault_span = NvtxSpan::new("cuvs/sample_prefault");
-    let prefault_start = Instant::now();
-    sample_values.iter_mut().for_each(|v| *v = 0.0);
-    let prefault = prefault_start.elapsed();
-    drop(prefault_span);
-    let mut copy_time = Duration::default();
+    let mut pending: Vec<(usize, FixedSizeListArray)> = Vec::new();
     let mut offset_rows = 0usize;
     while let Some(batch) = stream.try_next().await? {
         let vectors = vector_column_to_fsl(&batch, column)?;
@@ -943,7 +958,32 @@ async fn sample_training_vectors(
         if rows == 0 {
             continue;
         }
-        let copy_start = Instant::now();
+        pending.push((offset_rows, vectors));
+        offset_rows += rows;
+    }
+    let collect = collect_start.elapsed();
+    nvtx::mark!("cuvs/sample_collect_end");
+
+    if offset_rows == 0 {
+        return Err(Error::invalid_input(
+            "cuVS training sample did not return any vectors",
+        ));
+    }
+
+    nvtx::mark!("cuvs/sample_prefault_join_start");
+    let prefault_wait_start = Instant::now();
+    let mut sample_values = prefault_handle
+        .await
+        .map_err(|error| Error::io(format!("sample prefault task failed: {error}")))?;
+    let prefault_wait = prefault_wait_start.elapsed();
+    nvtx::mark!("cuvs/sample_prefault_join_end");
+
+    // Fully synchronous (no `.await` inside), so a push/pop range is safe
+    // here. Should be fast now that the destination pages are resident.
+    let copy_span = NvtxSpan::new("cuvs/sample_copy");
+    let copy_start = Instant::now();
+    for (dst_offset_rows, vectors) in pending {
+        let rows = vectors.len();
         let matrix = matrix_from_vectors(&vectors)?;
         let src: &[f32] = match &matrix {
             MatrixBuffer::Borrowed { values, .. } => values,
@@ -958,29 +998,23 @@ async fn sample_training_vectors(
                 src.len()
             )));
         }
-        let dst_start = offset_rows * dimension;
+        let dst_start = dst_offset_rows * dimension;
         let dst_end = dst_start + src.len();
         if dst_end > sample_values.len() {
             sample_values.resize(dst_end, 0.0);
         }
         sample_values[dst_start..dst_end].copy_from_slice(src);
-        copy_time += copy_start.elapsed();
-        offset_rows += rows;
     }
-    let collect = collect_start.elapsed();
-    nvtx::mark!("cuvs/sample_collect_end");
+    let copy = copy_start.elapsed();
+    drop(copy_span);
 
-    if offset_rows == 0 {
-        return Err(Error::invalid_input(
-            "cuVS training sample did not return any vectors",
-        ));
-    }
     sample_values.truncate(offset_rows * dimension);
     eprintln!(
-        "cuVS train sample collect: total_s={:.3} prefault_s={:.3} copy_s={:.3} rows={}",
+        "cuVS train sample collect: total_s={:.3} collect_s={:.3} prefault_wait_s={:.3} copy_s={:.3} rows={}",
+        (collect + prefault_wait + copy).as_secs_f64(),
         collect.as_secs_f64(),
-        prefault.as_secs_f64(),
-        copy_time.as_secs_f64(),
+        prefault_wait.as_secs_f64(),
+        copy.as_secs_f64(),
         offset_rows,
     );
 
