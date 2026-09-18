@@ -1057,18 +1057,24 @@ async fn scan_transform_batches(
     let mut stream = scanner.try_into_stream().await?;
     let mut stats = ArtifactScannerStats::default();
 
-    // No NVTX here: these spans cross an `.await`, and `nvtx`'s push/pop
-    // (the only ranges this crate version exposes) are nested/thread-local --
-    // a multi-threaded Tokio runtime may resume the task on a different
-    // worker thread and corrupt that thread's NVTX stack. The `Duration`
-    // accumulators below are the source of truth for this stage's timing.
+    // Instant markers, not push/pop: these spans cross an `.await`, and a
+    // multi-threaded Tokio runtime may resume the task on a different
+    // worker thread, which would corrupt a thread-local push/pop stack.
+    // Bounds just the `try_next()` call (matching `scan_wait`'s own scope,
+    // not `raw_send`'s downstream-backpressure wait) so a trace can isolate
+    // how much of scan_wait is genuine I/O vs. CPU-bound decode work --
+    // same diagnostic that found sample_training_vectors' page-fault/
+    // single-threaded-copy overhead hiding inside its own "collect" timer.
     loop {
+        nvtx::mark!("cuvs/scan_batch_start");
         let scan_start = Instant::now();
         let Some(batch) = stream.try_next().await? else {
             stats.scan_wait += scan_start.elapsed();
+            nvtx::mark!("cuvs/scan_batch_end");
             break;
         };
         stats.scan_wait += scan_start.elapsed();
+        nvtx::mark!("cuvs/scan_batch_end");
         stats.input_batches += 1;
         stats.input_rows += batch.num_rows();
 
