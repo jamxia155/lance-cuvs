@@ -31,8 +31,11 @@ use lance_linalg::distance::DistanceType;
 use log::warn;
 use ndarray::Array2;
 use std::collections::HashMap;
+use std::future::Future;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 /// RAII wrapper around `nvtx::range_push!`/`range_pop!`.
@@ -58,6 +61,65 @@ impl NvtxSpan {
 impl Drop for NvtxSpan {
     fn drop(&mut self) {
         nvtx::range_pop!();
+    }
+}
+
+/// Reads this thread's cumulative CPU time (`CLOCK_THREAD_CPUTIME_ID`), which
+/// only advances while this specific OS thread is actually executing --
+/// unlike wall-clock time, it does not advance while the thread is blocked
+/// (e.g. on I/O) or descheduled.
+fn thread_cpu_time() -> Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, appropriately-sized out-parameter for
+    // `clock_gettime`; `CLOCK_THREAD_CPUTIME_ID` is always available on Linux.
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts);
+    }
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+/// Wraps a future to measure the CPU time actually spent advancing it,
+/// immune to Tokio work-stealing moving the task across OS threads between
+/// polls: each individual `poll()` call runs start-to-finish on a single
+/// thread (migration only happens *between* polls, while the task is
+/// suspended), so summing per-poll `CLOCK_THREAD_CPUTIME_ID` deltas gives a
+/// migration-safe total regardless of which thread(s) executed it.
+///
+/// This exists because OS-level CPU sampling (nsys `--sample`) on this
+/// environment lacks real kernel scheduling info (nsys itself reports
+/// "Scheduling information is absent... deduced... This is inaccurate"),
+/// making its `Running`-vs-blocked thread-state classification untrustworthy
+/// for distinguishing genuine CPU-bound work from idle/blocked time.
+/// Measuring CPU time in-process via `clock_gettime` sidesteps that entirely.
+struct CpuTimedFuture<F> {
+    inner: F,
+    cpu_time: Duration,
+}
+
+impl<F> CpuTimedFuture<F> {
+    fn new(inner: F) -> Self {
+        Self {
+            inner,
+            cpu_time: Duration::ZERO,
+        }
+    }
+}
+
+impl<F: Future + Unpin> Future for CpuTimedFuture<F> {
+    type Output = (F::Output, Duration);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let before = thread_cpu_time();
+        let poll_result = Pin::new(&mut this.inner).poll(cx);
+        this.cpu_time += thread_cpu_time().saturating_sub(before);
+        match poll_result {
+            Poll::Ready(output) => Poll::Ready((output, this.cpu_time)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -460,6 +522,7 @@ struct ArtifactScannerStats {
     input_batches: usize,
     input_rows: usize,
     scan_wait: Duration,
+    scan_cpu: Duration,
     send: Duration,
 }
 
@@ -679,6 +742,7 @@ struct ArtifactBuildStats {
     output_batches: usize,
     output_rows: usize,
     scan_wait: Duration,
+    scan_cpu: Duration,
     raw_send: Duration,
     raw_wait: Duration,
     drain: Duration,
@@ -714,6 +778,7 @@ impl ArtifactBuildStats {
         self.input_batches += scanner.input_batches;
         self.input_rows += scanner.input_rows;
         self.scan_wait += scanner.scan_wait;
+        self.scan_cpu += scanner.scan_cpu;
         self.raw_send += scanner.send;
     }
 
@@ -760,7 +825,7 @@ impl ArtifactBuildStats {
 
     fn log(&self) {
         eprintln!(
-            "cuVS artifact stages: scanner_tasks={} prepare_workers={} input_batches={} input_rows={} prepared_batches={} prepared_rows={} output_batches={} output_rows={} scan_wait_s={:.3} raw_send_s={:.3} raw_wait_s={:.3} drain_s={:.3} send_s={:.3} prepare_send_s={:.3} vector_s={:.3} filter_s={:.3} matrix_s={:.3} launch_s={:.3}",
+            "cuVS artifact stages: scanner_tasks={} prepare_workers={} input_batches={} input_rows={} prepared_batches={} prepared_rows={} output_batches={} output_rows={} scan_wait_s={:.3} scan_cpu_s={:.3} raw_send_s={:.3} raw_wait_s={:.3} drain_s={:.3} send_s={:.3} prepare_send_s={:.3} vector_s={:.3} filter_s={:.3} matrix_s={:.3} launch_s={:.3}",
             self.scanner_tasks,
             self.prepare_workers,
             self.input_batches,
@@ -770,6 +835,7 @@ impl ArtifactBuildStats {
             self.output_batches,
             self.output_rows,
             secs(self.scan_wait),
+            secs(self.scan_cpu),
             secs(self.raw_send),
             secs(self.raw_wait),
             secs(self.drain),
@@ -1061,19 +1127,21 @@ async fn scan_transform_batches(
     // multi-threaded Tokio runtime may resume the task on a different
     // worker thread, which would corrupt a thread-local push/pop stack.
     // Bounds just the `try_next()` call (matching `scan_wait`'s own scope,
-    // not `raw_send`'s downstream-backpressure wait) so a trace can isolate
-    // how much of scan_wait is genuine I/O vs. CPU-bound decode work --
-    // same diagnostic that found sample_training_vectors' page-fault/
-    // single-threaded-copy overhead hiding inside its own "collect" timer.
+    // not `raw_send`'s downstream-backpressure wait). `scan_cpu` (via
+    // `CpuTimedFuture`) measures genuine in-process CPU time spent advancing
+    // this same call, migration-safe and independent of nsys's thread-state
+    // sampling -- `scan_wait - scan_cpu` is time this call spent blocked
+    // (I/O, scheduling) rather than actually computing.
     loop {
         nvtx::mark!("cuvs/scan_batch_start");
         let scan_start = Instant::now();
-        let Some(batch) = stream.try_next().await? else {
-            stats.scan_wait += scan_start.elapsed();
+        let (next, cpu_time) = CpuTimedFuture::new(stream.try_next()).await;
+        stats.scan_wait += scan_start.elapsed();
+        stats.scan_cpu += cpu_time;
+        let Some(batch) = next? else {
             nvtx::mark!("cuvs/scan_batch_end");
             break;
         };
-        stats.scan_wait += scan_start.elapsed();
         nvtx::mark!("cuvs/scan_batch_end");
         stats.input_batches += 1;
         stats.input_rows += batch.num_rows();
