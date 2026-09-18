@@ -13,6 +13,28 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use std::collections::HashMap;
 
+/// Build the tokio runtime that drives dataset load/scan/transform for a
+/// single `train_ivf_pq`/`build_ivf_pq_artifact` call.
+///
+/// Diagnostic-only: `LANCE_DIAGNOSTIC_SINGLE_THREAD_EXECUTOR=1` pins this
+/// runtime to a single worker thread so CPU profiling/sampling can
+/// attribute samples to a task without work-stealing migrating it across
+/// threads mid-await (confirmed via NVTX scan_batch_start/end marks
+/// showing migration even within a single batch's own await). Off by
+/// default; not intended for normal use since it serializes everything
+/// scheduled on this runtime and changes wall-clock timings, not just
+/// their attribution.
+fn new_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    if std::env::var("LANCE_DIAGNOSTIC_SINGLE_THREAD_EXECUTOR").is_ok() {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+    } else {
+        tokio::runtime::Runtime::new()
+    }
+}
+
 #[pyclass(
     name = "IvfPqTrainingOutput",
     module = "lance_cuvs_backend_cu12._native",
@@ -135,8 +157,7 @@ fn train_ivf_pq_py(
     storage_options: Option<HashMap<String, String>>,
 ) -> PyResult<Py<PyTrainedIvfPqIndex>> {
     let metric_type = parse_distance_type(metric_type)?;
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let runtime = new_runtime().map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
 
     let mut builder = DatasetBuilder::from_uri(dataset_uri);
     if let Some(storage_options) = storage_options {
@@ -187,8 +208,7 @@ fn build_ivf_pq_artifact<'py>(
     filter_nan: bool,
     storage_options: Option<HashMap<String, String>>,
 ) -> PyResult<Py<PyPartitionArtifactBuildOutput>> {
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let runtime = new_runtime().map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
 
     let mut builder = DatasetBuilder::from_uri(dataset_uri);
     if let Some(storage_options) = storage_options.clone() {
