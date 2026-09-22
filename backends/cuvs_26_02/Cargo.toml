@@ -17,6 +17,13 @@ python = ["dep:arrow-pyarrow", "dep:pyo3"]
 
 [dependencies]
 arrow = "57.0.0"
+# Used only by alloc_trace.rs (debug instrumentation): captures raw,
+# unresolved stack frames cheaply. Deliberately not using std's
+# `std::backtrace::Backtrace` -- formatting/resolving it against this
+# crate's large release-with-debug binary (embedded DWARF, ~2GB+) is slow
+# enough to look like a hang when done live, inside a hot allocation path.
+# Symbolication is instead done offline, after capture.
+backtrace = "0.3"
 arrow-array = "57.0.0"
 arrow-buffer = "57.0.0"
 arrow-schema = "57.0.0"

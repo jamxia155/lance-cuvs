@@ -1,13 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Debug-only instrumentation: logs a symbolicated backtrace for every
-//! Rust-side allocation at or above `LANCE_CUVS_ALLOC_TRACE_MIN_BYTES`
+//! Debug-only instrumentation: logs a *raw, unresolved* stack trace for
+//! every Rust-side allocation at or above `LANCE_CUVS_ALLOC_TRACE_MIN_BYTES`
 //! bytes (default 2MiB -- comfortably below the smallest step in the
 //! 2/4/8/16/32/64/128 MiB `mmap`/`munmap` doubling pattern this is meant to
 //! diagnose). Disabled unless `LANCE_CUVS_ALLOC_TRACE=1` is set; when
 //! disabled this is a transparent passthrough to the system allocator with
 //! one cached `OnceLock` read of overhead per call.
+//!
+//! Deliberately uses the `backtrace` crate's unresolved capture
+//! (`Backtrace::new_unresolved`) rather than `std::backtrace::Backtrace`:
+//! symbolicating against this crate's `release-with-debug` binary (embedded
+//! DWARF, multiple GB) live, inside a hot allocation path, is slow enough
+//! to look like a hang. This logs raw instruction pointers only; resolve
+//! them offline afterward (same file-offset + `gdb -batch -ex "info line
+//! *<offset>"` approach used elsewhere in this investigation -- see
+//! `profiling/PINNED_BUFFER_POOL_DESIGN.md`). The `_native.abi3.so`
+//! mapping line from `/proc/self/maps` is logged once so the offset math
+//! can be done directly from this file, without a separate `perf` capture.
 //!
 //! This intercepts allocations made by any Rust code statically linked into
 //! this `.so` (lance-file, lance-encoding, lance-io, lance-table, this
@@ -16,9 +27,8 @@
 //! large sizes) does with it. It does not see non-Rust (CUDA driver, glibc
 //! internals) allocations.
 //!
-//! Temporary debugging aid for the pinned-buffer-pool investigation
-//! (see `profiling/PINNED_BUFFER_POOL_DESIGN.md`) -- not meant to ship
-//! enabled, and not meant to stay in the tree long-term.
+//! Temporary debugging aid for the pinned-buffer-pool investigation --
+//! not meant to ship enabled, and not meant to stay in the tree long-term.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -40,10 +50,27 @@ fn min_bytes() -> usize {
     })
 }
 
+/// The `_native.abi3.so` line(s) from `/proc/self/maps`, read once and
+/// cached, so the log is self-contained for offline offset computation.
+fn maps_line_once() -> &'static str {
+    static MAPS: OnceLock<String> = OnceLock::new();
+    MAPS.get_or_init(|| {
+        std::fs::read_to_string("/proc/self/maps")
+            .ok()
+            .map(|contents| {
+                contents
+                    .lines()
+                    .filter(|l| l.contains("_native.abi3.so"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|| "<failed to read /proc/self/maps>".to_string())
+    })
+}
+
 thread_local! {
-    // Backtrace capture/formatting itself allocates. Guard against
-    // re-entering the logger from within its own capture -- skip logging
-    // for that inner allocation rather than recursing.
+    // Guard against the (unlikely, but possible) case of this logger's own
+    // bookkeeping allocating above the threshold and re-entering itself.
     static IN_LOGGER: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -91,14 +118,21 @@ fn maybe_log(kind: &str, size: usize, align: usize) {
     if !should_log {
         return;
     }
+
     let seq = ALLOC_TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
-    // force_capture() always captures, unlike capture() which respects
-    // RUST_BACKTRACE/RUST_LIB_BACKTRACE and may no-op if unset.
-    let bt = std::backtrace::Backtrace::force_capture();
+
+    // Unresolved capture: just walks the stack (frame-pointer or CFI based),
+    // no symbol/DWARF lookup at all. Cheap and safe to do inline.
+    let bt = backtrace::Backtrace::new_unresolved();
+    let ips: Vec<String> = bt.frames().iter().map(|f| format!("{:?}", f.ip())).collect();
+
     eprintln!(
-        "[alloc-trace #{seq}] {kind} size={size} align={align} tid={:?}\n{bt}\n---END #{seq}---",
-        std::thread::current().id()
+        "[alloc-trace #{seq}] {kind} size={size} align={align} tid={:?}\nmaps: {}\nips: {}\n---END #{seq}---",
+        std::thread::current().id(),
+        maps_line_once(),
+        ips.join(" "),
     );
+
     IN_LOGGER.with(|f| f.set(false));
 }
 
