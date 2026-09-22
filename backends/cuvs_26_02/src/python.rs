@@ -240,6 +240,15 @@ fn build_ivf_pq_artifact<'py>(
 
 #[pymodule]
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // This crate statically links its own copy of `lance`/`lance-io`, separate
+    // from pylance's; without this, `log::debug!`/etc. calls in that copy are
+    // no-ops regardless of LANCE_LOG/RUST_LOG, since no logger backend is
+    // ever installed for this .so's copy of the `log` crate's global state.
+    // Matches pylance's own convention (LANCE_LOG, default "warn"), not
+    // RUST_LOG.
+    let _ = env_logger::Builder::from_env(env_logger::Env::new().filter_or("LANCE_LOG", "warn"))
+        .try_init();
+
     m.add_class::<PyTrainedIvfPqIndex>()?;
     m.add_class::<PyPartitionArtifactBuildOutput>()?;
     m.add_function(wrap_pyfunction!(train_ivf_pq_py, m)?)?;
