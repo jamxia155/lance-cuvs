@@ -11,6 +11,7 @@
 //! Callers are expected to pass the returned artifact and training outputs back
 //! to Lance's own index creation APIs.
 
+mod alloc_trace;
 mod backend;
 mod cuda;
 #[cfg(feature = "python")]
