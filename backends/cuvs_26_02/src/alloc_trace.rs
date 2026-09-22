@@ -32,15 +32,37 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::ffi::CStr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Reads an environment variable via raw `libc::getenv` rather than
+/// `std::env::var`/`var_os`. This is load-bearing, not a style choice:
+/// `std::env::var` allocates a `String` when the variable is set, and since
+/// this crate is `#[global_allocator]`, that allocation re-enters
+/// `AllocTracer::alloc` -> `maybe_log` -> `enabled()`/`min_bytes()` ->
+/// (tries to) `OnceLock::get_or_init` again, on the same thread, from
+/// within that same `OnceLock`'s own initializer. `OnceLock` is not
+/// reentrant-safe for that and deadlocks waiting on itself. `getenv`
+/// returns a pointer straight into the existing environment block with no
+/// allocation at all, so it can't trigger this.
+fn getenv_str(name: &CStr) -> Option<&'static str> {
+    unsafe {
+        let ptr = libc::getenv(name.as_ptr());
+        if ptr.is_null() {
+            None
+        } else {
+            CStr::from_ptr(ptr).to_str().ok()
+        }
+    }
+}
 
 fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         matches!(
-            std::env::var("LANCE_CUVS_ALLOC_TRACE").as_deref(),
-            Ok("1") | Ok("true")
+            getenv_str(c"LANCE_CUVS_ALLOC_TRACE"),
+            Some("1") | Some("true")
         )
     })
 }
@@ -48,8 +70,7 @@ fn enabled() -> bool {
 fn min_bytes() -> usize {
     static MIN_BYTES: OnceLock<usize> = OnceLock::new();
     *MIN_BYTES.get_or_init(|| {
-        std::env::var("LANCE_CUVS_ALLOC_TRACE_MIN_BYTES")
-            .ok()
+        getenv_str(c"LANCE_CUVS_ALLOC_TRACE_MIN_BYTES")
             .and_then(|v| v.parse().ok())
             .unwrap_or(2 * 1024 * 1024)
     })
