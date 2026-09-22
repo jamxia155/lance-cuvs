@@ -37,7 +37,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("LANCE_CUVS_ALLOC_TRACE").is_ok())
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("LANCE_CUVS_ALLOC_TRACE").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
 }
 
 fn min_bytes() -> usize {
@@ -52,6 +57,8 @@ fn min_bytes() -> usize {
 
 /// The `_native.abi3.so` line(s) from `/proc/self/maps`, read once and
 /// cached, so the log is self-contained for offline offset computation.
+/// Currently unused -- see the bisection note in `maybe_log`.
+#[allow(dead_code)]
 fn maps_line_once() -> &'static str {
     static MAPS: OnceLock<String> = OnceLock::new();
     MAPS.get_or_init(|| {
@@ -121,17 +128,14 @@ fn maybe_log(kind: &str, size: usize, align: usize) {
 
     let seq = ALLOC_TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
 
-    // Unresolved capture: just walks the stack (frame-pointer or CFI based),
-    // no symbol/DWARF lookup at all. Cheap and safe to do inline.
-    let bt = backtrace::Backtrace::new_unresolved();
-    let ips: Vec<String> = bt.frames().iter().map(|f| format!("{:?}", f.ip())).collect();
-
-    eprintln!(
-        "[alloc-trace #{seq}] {kind} size={size} align={align} tid={:?}\nmaps: {}\nips: {}\n---END #{seq}---",
-        std::thread::current().id(),
-        maps_line_once(),
-        ips.join(" "),
-    );
+    // TEMPORARY bisection step: stack capture removed entirely. Both
+    // std::backtrace::Backtrace and backtrace::Backtrace::new_unresolved()
+    // caused a hang when actually triggered; this minimal version (just the
+    // size/kind/seq, no unwinding at all) is here to confirm whether the
+    // hang is really caused by stack capture specifically, or something
+    // else in this logging path (stdio, thread-local access, etc.). If
+    // this version also hangs, the backtrace capture is not the cause.
+    eprintln!("[alloc-trace #{seq}] {kind} size={size} align={align}");
 
     IN_LOGGER.with(|f| f.set(false));
 }
