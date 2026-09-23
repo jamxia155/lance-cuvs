@@ -13,6 +13,7 @@ use ndarray::{Array2, ArrayView2};
 use std::ffi::{CStr, c_void};
 use std::marker::PhantomData;
 use std::ptr;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 pub(crate) type CudaEventHandle = *mut c_void;
 
@@ -440,6 +441,145 @@ impl<T> Drop for PinnedHostBuffer<T> {
             let _ = unsafe { cudaFreeHost(self.ptr.cast::<c_void>()) };
         }
     }
+}
+
+// A `PinnedHostBuffer` exclusively owns its `cudaMallocHost` allocation -- no
+// other handle aliases it -- so moving it to another thread is sound, and
+// `cudaFreeHost` is thread-safe. Needed so buffers can move through the
+// staging pool between prepare workers and the pipeline driver.
+unsafe impl<T: Send> Send for PinnedHostBuffer<T> {}
+
+/// A fixed set of page-locked host buffers, allocated once per artifact build
+/// and recycled across batches, used as the H2D copy source in place of
+/// registering each batch's own decoded buffer with `cudaHostRegister`.
+///
+/// Per-batch registration measured ~3 s per scan stage for 64 x 610 MiB
+/// batches, and registrations queue behind each other (~31 ms median alone,
+/// 56-96 ms with one or more already in flight) while holding `mmap_lock` for
+/// read during pinning, which also stalls concurrent `munmap`s. Copying into
+/// an already-pinned slot replaces that with a plain memcpy. See
+/// `profiling/PINNED_BUFFER_POOL_DESIGN.md`.
+///
+/// Slots are only ever allocated here, up front -- never per batch: a
+/// per-batch `cudaMallocHost`/`cudaFreeHost` would put synchronizing CUDA
+/// allocation calls back into the multi-threaded pipeline.
+pub(crate) struct PinnedStagingPool {
+    free: Mutex<Vec<PinnedHostBuffer<f32>>>,
+    returned: Condvar,
+    slot_len: usize,
+}
+
+impl PinnedStagingPool {
+    pub(crate) fn try_new(slots: usize, slot_len: usize) -> Result<Arc<Self>> {
+        let free = (0..slots)
+            .map(|_| PinnedHostBuffer::try_new(slot_len))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(Self {
+            free: Mutex::new(free),
+            returned: Condvar::new(),
+            slot_len,
+        }))
+    }
+
+    /// Capacity of each slot, in `f32` elements.
+    pub(crate) fn slot_len(&self) -> usize {
+        self.slot_len
+    }
+
+    /// Takes a free slot, blocking until one is returned if none is free.
+    ///
+    /// Blocks the calling OS thread: call it only from a blocking-capable
+    /// thread (e.g. inside `spawn_blocking`), never directly on an async task.
+    pub(crate) fn acquire(self: &Arc<Self>) -> PinnedStagingSlot {
+        let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if let Some(buffer) = free.pop() {
+                return PinnedStagingSlot {
+                    buffer: Some(buffer),
+                    len: 0,
+                    pool: Arc::clone(self),
+                };
+            }
+            free = self
+                .returned
+                .wait(free)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// One slot checked out of a [`PinnedStagingPool`]; returns itself to the pool
+/// on drop.
+///
+/// The holder must keep the slot alive until any async copy reading from it
+/// has completed -- dropping it earlier would let another batch overwrite a
+/// buffer the GPU is still reading. The transform pipeline holds it in its
+/// `TransformSlot` until the drain has synchronized on `output_ready`, which
+/// is recorded after the H2D copy on the same stream.
+pub(crate) struct PinnedStagingSlot {
+    buffer: Option<PinnedHostBuffer<f32>>,
+    len: usize,
+    pool: Arc<PinnedStagingPool>,
+}
+
+impl PinnedStagingSlot {
+    /// Copies `src` into the start of the slot, split across up to
+    /// `copy_threads` threads.
+    pub(crate) fn fill_from(&mut self, src: &[f32], copy_threads: usize) -> Result<()> {
+        let buffer = self
+            .buffer
+            .as_mut()
+            .ok_or_else(|| Error::io("pinned staging slot has already been released"))?;
+        let dst = buffer.prefix_mut(src.len())?;
+        parallel_copy(dst, src, copy_threads);
+        self.len = src.len();
+        Ok(())
+    }
+
+    /// The filled prefix of the slot.
+    pub(crate) fn as_slice(&self) -> Result<&[f32]> {
+        self.buffer
+            .as_ref()
+            .ok_or_else(|| Error::io("pinned staging slot has already been released"))?
+            .prefix(self.len)
+    }
+}
+
+impl Drop for PinnedStagingSlot {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            let mut free = self
+                .pool
+                .free
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            free.push(buffer);
+            drop(free);
+            self.pool.returned.notify_one();
+        }
+    }
+}
+
+/// Below this many bytes per thread, spawning copy threads costs more than it
+/// saves.
+const PARALLEL_COPY_MIN_BYTES_PER_THREAD: usize = 8 * 1024 * 1024;
+
+fn parallel_copy<T: Copy + Send + Sync>(dst: &mut [T], src: &[T], threads: usize) {
+    debug_assert_eq!(dst.len(), src.len());
+    let bytes = std::mem::size_of_val(src);
+    let threads = threads
+        .min(bytes / PARALLEL_COPY_MIN_BYTES_PER_THREAD)
+        .max(1);
+    if threads == 1 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let chunk = src.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (dst, src) in dst.chunks_mut(chunk).zip(src.chunks(chunk)) {
+            scope.spawn(move || dst.copy_from_slice(src));
+        }
+    });
 }
 
 pub(crate) struct CudaEvent {

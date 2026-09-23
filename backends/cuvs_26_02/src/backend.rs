@@ -3,10 +3,10 @@
 
 use crate::cuda::{
     CudaEvent, CuvsIvfPqIndex, DeviceTensor, HostTensorView, MatrixBuffer, PinnedHostBuffer,
-    RegisteredHostBuffer, check_cuvs, copy_tensor_to_host_f32_2d, copy_tensor_to_host_f32_3d,
-    create_index_params, cuda_profiler_start, cuda_profiler_stop, destroy_index_params,
-    enable_rmm_pool_from_env, ivf_centroids_from_host, make_tensor_view, matrix_from_vectors,
-    pq_codebook_from_host,
+    PinnedStagingPool, PinnedStagingSlot, RegisteredHostBuffer, check_cuvs,
+    copy_tensor_to_host_f32_2d, copy_tensor_to_host_f32_3d, create_index_params,
+    cuda_profiler_start, cuda_profiler_stop, destroy_index_params, enable_rmm_pool_from_env,
+    ivf_centroids_from_host, make_tensor_view, matrix_from_vectors, pq_codebook_from_host,
 };
 use arrow::compute::filter;
 use arrow_array::cast::AsArray;
@@ -137,6 +137,10 @@ const TRAINING_SAMPLE_BATCH_READAHEAD: usize = 64;
 // observed using ~35 threads for concurrent reads) while it runs alongside
 // it in the background. Overridable via LANCE_CUVS_SAMPLE_PREFAULT_THREADS.
 const DEFAULT_SAMPLE_PREFAULT_THREADS: usize = 8;
+// Threads per batch for copying a decoded batch into its pinned staging slot
+// (LANCE_CUVS_PINNED_STAGING_COPY_THREADS). Each prepare worker copies its own
+// batch, so total copy concurrency is up to prepare_workers x this.
+const DEFAULT_PINNED_STAGING_COPY_THREADS: usize = 4;
 
 /// A trained cuVS IVF_PQ model that can be reused for artifact builds.
 ///
@@ -452,6 +456,10 @@ struct TransformSlot {
     input_vectors: Option<FixedSizeListArray>,
     input_matrix: Option<Array2<f32>>,
     input_registration: Option<RegisteredHostBuffer>,
+    // Pinned staging slot the H2D copy reads from, when staging is enabled.
+    // Held until `drain_to_batch` has synchronized on `output_ready` -- see
+    // `PinnedStagingSlot`.
+    input_staging: Option<PinnedStagingSlot>,
     row_ids: Option<Arc<dyn Array>>,
     rows: usize,
 }
@@ -463,19 +471,25 @@ enum PreparedMatrix {
         dimension: usize,
     },
     Owned(Array2<f32>),
+    // Already copied into the batch's pinned staging slot; the decoded Arrow
+    // buffer was freed in the prepare worker right after the copy.
+    Staged {
+        rows: usize,
+        dimension: usize,
+    },
 }
 
 impl PreparedMatrix {
     fn rows(&self) -> usize {
         match self {
-            Self::F32Arrow { rows, .. } => *rows,
+            Self::F32Arrow { rows, .. } | Self::Staged { rows, .. } => *rows,
             Self::Owned(array) => array.nrows(),
         }
     }
 
     fn dimension(&self) -> usize {
         match self {
-            Self::F32Arrow { dimension, .. } => *dimension,
+            Self::F32Arrow { dimension, .. } | Self::Staged { dimension, .. } => *dimension,
             Self::Owned(array) => array.ncols(),
         }
     }
@@ -489,6 +503,9 @@ impl PreparedMatrix {
             Self::Owned(array) => array
                 .as_slice_memory_order()
                 .ok_or_else(|| Error::io("transform matrix is not contiguous")),
+            Self::Staged { .. } => Err(Error::io(
+                "staged transform batch has no host matrix; read its pinned staging slot",
+            )),
         }
     }
 }
@@ -497,6 +514,7 @@ struct PreparedTransformBatch {
     row_ids: Arc<dyn Array>,
     matrix: PreparedMatrix,
     input_registration: Option<RegisteredHostBuffer>,
+    input_staging: Option<PinnedStagingSlot>,
 }
 
 struct DrainedTransformBatch {
@@ -538,6 +556,12 @@ struct ArtifactPrepareStats {
     matrix: Duration,
     register: Duration,
     registered_bytes: usize,
+    staging_wait: Duration,
+    staging_copy: Duration,
+    staged_bytes: usize,
+    // Batches that did not fit a staging slot and were copied to the GPU
+    // from pageable memory instead.
+    staging_fallbacks: usize,
 }
 
 impl TransformSlot {
@@ -560,6 +584,7 @@ impl TransformSlot {
             input_vectors: None,
             input_matrix: None,
             input_registration: None,
+            input_staging: None,
             row_ids: None,
             rows: 0,
         })
@@ -589,9 +614,13 @@ impl TransformSlot {
         let code_width = trained.pq_code_width();
         let row_ids = prepared.row_ids;
         let matrix = prepared.matrix;
+        let input_staging = prepared.input_staging;
         let rows = matrix.rows();
         let dimension = matrix.dimension();
-        let input_slice = matrix.input_slice()?;
+        let input_slice = match &input_staging {
+            Some(staging) => staging.as_slice()?,
+            None => matrix.input_slice()?,
+        };
 
         self.input_device.set_shape(&[rows, dimension])?;
         self.labels_device.set_shape(&[rows])?;
@@ -606,6 +635,9 @@ impl TransformSlot {
             .copy_from_host_async(&trained.resources, input_slice)?;
         timings.h2d_enqueue += h2d_enqueue_start.elapsed();
         self.h2d_done.record(stream)?;
+        // Keep the staging slot until the drain has synchronized: the copy
+        // just enqueued is still reading from it.
+        self.input_staging = input_staging;
         match matrix {
             PreparedMatrix::F32Arrow { vectors, .. } => {
                 self.input_vectors = Some(vectors);
@@ -614,6 +646,10 @@ impl TransformSlot {
             PreparedMatrix::Owned(array) => {
                 self.input_vectors = None;
                 self.input_matrix = Some(array);
+            }
+            PreparedMatrix::Staged { .. } => {
+                self.input_vectors = None;
+                self.input_matrix = None;
             }
         }
         let transform_call_start = Instant::now();
@@ -669,9 +705,13 @@ impl TransformSlot {
         // (`RegisteredHostBuffer`, whose `Drop` calls `cudaHostUnregister` --
         // confirmed non-trivial in an earlier CUDA-API trace, ~620ms/64
         // calls there) plus the input vectors/matrix buffers themselves.
+        // With pinned staging enabled, this only returns the staging slot to
+        // its pool: there is no registration, and the decoded buffer was
+        // already freed in the prepare worker.
         let release_span = NvtxSpan::new("cuvs/gpu_release_input");
         let release_start = Instant::now();
         self.input_registration = None;
+        self.input_staging = None;
         self.input_vectors = None;
         self.input_matrix = None;
         let release = release_start.elapsed();
@@ -770,6 +810,13 @@ struct ArtifactBuildStats {
     drain_build_batch: Duration,
     register: Duration,
     registered_bytes: usize,
+    staging_slots: usize,
+    staging_slot_bytes: usize,
+    staging_alloc: Duration,
+    staging_wait: Duration,
+    staging_copy: Duration,
+    staged_bytes: usize,
+    staging_fallbacks: usize,
 }
 
 impl ArtifactBuildStats {
@@ -793,6 +840,10 @@ impl ArtifactBuildStats {
         self.matrix += prepare.matrix;
         self.register += prepare.register;
         self.registered_bytes += prepare.registered_bytes;
+        self.staging_wait += prepare.staging_wait;
+        self.staging_copy += prepare.staging_copy;
+        self.staged_bytes += prepare.staged_bytes;
+        self.staging_fallbacks += prepare.staging_fallbacks;
     }
 
     fn record_output(&mut self, batch: &RecordBatch) {
@@ -851,6 +902,21 @@ impl ArtifactBuildStats {
             secs(self.register),
             self.registered_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         );
+        if self.staging_slots > 0 {
+            // staging_wait_s: time prepare workers spent blocked waiting for
+            // a free slot (pipeline backpressure, not copy cost).
+            eprintln!(
+                "cuVS artifact h2d staging: slots={} slot_mib={:.1} pinned_gib={:.3} alloc_s={:.3} wait_s={:.3} copy_s={:.3} staged_gib={:.3} fallbacks={}",
+                self.staging_slots,
+                self.staging_slot_bytes as f64 / (1024.0 * 1024.0),
+                (self.staging_slots * self.staging_slot_bytes) as f64 / (1024.0 * 1024.0 * 1024.0),
+                secs(self.staging_alloc),
+                secs(self.staging_wait),
+                secs(self.staging_copy),
+                self.staged_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                self.staging_fallbacks,
+            );
+        }
         eprintln!(
             "cuVS artifact gpu events: h2d_s={:.3} transform_s={:.3} d2h_s={:.3}",
             secs(self.gpu_h2d),
@@ -929,6 +995,50 @@ fn scan_fragment_readahead_from_env() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_SCAN_FRAGMENT_READAHEAD)
+}
+
+/// `LANCE_CUVS_PINNED_STAGING=1` (or `true`): copy each decoded batch into a
+/// pre-pinned staging slot for the H2D copy, instead of registering the
+/// decoded buffer itself with `cudaHostRegister`. Off by default so the two
+/// paths can be A/B'd.
+fn pinned_staging_enabled_from_env() -> bool {
+    matches!(
+        std::env::var("LANCE_CUVS_PINNED_STAGING").ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+fn pinned_staging_slots_from_env(default: usize) -> usize {
+    std::env::var("LANCE_CUVS_PINNED_STAGING_SLOTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|slots| *slots > 0)
+        .unwrap_or(default)
+}
+
+fn pinned_staging_copy_threads_from_env() -> usize {
+    std::env::var("LANCE_CUVS_PINNED_STAGING_COPY_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or(DEFAULT_PINNED_STAGING_COPY_THREADS)
+}
+
+/// Rows per staging slot: the largest fragment's physical row count, capped
+/// at `batch_size`. The scan yields batches within a single fragment, so this
+/// is the largest batch it can produce, and sizing to `batch_size` alone
+/// would waste pinned memory whenever fragments are smaller (e.g. 1 GiB slots
+/// for 610 MiB batches at the default 128Ki-row `batch_size`). Falls back to
+/// `batch_size` when any fragment lacks a physical row count. A batch that
+/// still does not fit is copied from pageable memory rather than staged.
+fn staging_slot_rows(dataset: &Dataset, batch_size: usize) -> usize {
+    dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.metadata().physical_rows)
+        .try_fold(0usize, |max_rows, rows| rows.map(|rows| max_rows.max(rows)))
+        .filter(|rows| *rows > 0)
+        .map_or(batch_size, |rows| rows.min(batch_size))
 }
 
 fn scan_batch_readahead_from_env() -> usize {
@@ -1161,6 +1271,8 @@ fn prepare_transform_batch(
     batch: RecordBatch,
     column: &str,
     filter_nan: bool,
+    staging: Option<&Arc<PinnedStagingPool>>,
+    copy_threads: usize,
     stats: &mut ArtifactPrepareStats,
 ) -> Result<Option<PreparedTransformBatch>> {
     stats.input_batches += 1;
@@ -1243,41 +1355,85 @@ fn prepare_transform_batch(
     stats.matrix += matrix_start.elapsed();
     drop(matrix_span);
 
-    let register_span = NvtxSpan::new("cuvs/prepare_register");
-    let (prepared_matrix, input_registration) = match matrix {
-        MatrixBuffer::Borrowed { values, rows, cols } => {
-            let register_start = Instant::now();
-            let registration = match RegisteredHostBuffer::try_new(values) {
-                Ok(registration) => Some(registration),
-                Err(error) => {
-                    warn!(
-                        "failed to register host vector buffer for CUDA H2D; falling back to pageable memory: {error}"
-                    );
-                    None
-                }
-            };
-            stats.register += register_start.elapsed();
-            stats.registered_bytes += registration
-                .as_ref()
-                .map(RegisteredHostBuffer::original_bytes)
-                .unwrap_or_default();
-            (
-                PreparedMatrix::F32Arrow {
-                    vectors: filtered_vectors,
-                    rows,
-                    dimension: cols,
-                },
-                registration,
-            )
-        }
-        MatrixBuffer::Owned(array) => (PreparedMatrix::Owned(array), None),
+    let (prepared_matrix, input_registration, input_staging) = match matrix {
+        MatrixBuffer::Borrowed { values, rows, cols } => match staging {
+            Some(pool) if values.len() <= pool.slot_len() => {
+                let stage_span = NvtxSpan::new("cuvs/prepare_stage");
+                let wait_start = Instant::now();
+                let mut slot = pool.acquire();
+                stats.staging_wait += wait_start.elapsed();
+                let copy_start = Instant::now();
+                slot.fill_from(values, copy_threads)?;
+                stats.staging_copy += copy_start.elapsed();
+                stats.staged_bytes += std::mem::size_of_val(values);
+                drop(stage_span);
+                // `filtered_vectors` -- the decoded buffer -- is not carried
+                // forward: it is freed when this function returns, here on the
+                // prepare worker, instead of in the pipeline driver's drain.
+                (
+                    PreparedMatrix::Staged {
+                        rows,
+                        dimension: cols,
+                    },
+                    None,
+                    Some(slot),
+                )
+            }
+            Some(_) => {
+                // Too large for a slot: send it from pageable memory.
+                // Deliberately not registered. With staging on, only the
+                // dedicated staging slots ever act as pinned H2D sources;
+                // `cudaHostRegister` rounds out to whole pages, which is only
+                // safe for buffers that own their pages, so keeping arbitrary
+                // heap buffers out of it keeps allocator changes safe.
+                stats.staging_fallbacks += 1;
+                (
+                    PreparedMatrix::F32Arrow {
+                        vectors: filtered_vectors,
+                        rows,
+                        dimension: cols,
+                    },
+                    None,
+                    None,
+                )
+            }
+            None => {
+                let register_span = NvtxSpan::new("cuvs/prepare_register");
+                let register_start = Instant::now();
+                let registration = match RegisteredHostBuffer::try_new(values) {
+                    Ok(registration) => Some(registration),
+                    Err(error) => {
+                        warn!(
+                            "failed to register host vector buffer for CUDA H2D; falling back to pageable memory: {error}"
+                        );
+                        None
+                    }
+                };
+                stats.register += register_start.elapsed();
+                stats.registered_bytes += registration
+                    .as_ref()
+                    .map(RegisteredHostBuffer::original_bytes)
+                    .unwrap_or_default();
+                drop(register_span);
+                (
+                    PreparedMatrix::F32Arrow {
+                        vectors: filtered_vectors,
+                        rows,
+                        dimension: cols,
+                    },
+                    registration,
+                    None,
+                )
+            }
+        },
+        MatrixBuffer::Owned(array) => (PreparedMatrix::Owned(array), None, None),
     };
-    drop(register_span);
 
     Ok(Some(PreparedTransformBatch {
         row_ids: filtered_row_ids,
         matrix: prepared_matrix,
         input_registration,
+        input_staging,
     }))
 }
 
@@ -1286,6 +1442,8 @@ async fn prepare_transform_batches(
     filter_nan: bool,
     raw_rx: Arc<Mutex<mpsc::Receiver<RecordBatch>>>,
     mut prepared_tx: mpsc::Sender<PreparedTransformBatch>,
+    staging: Option<Arc<PinnedStagingPool>>,
+    copy_threads: usize,
 ) -> Result<ArtifactPrepareStats> {
     let mut stats = ArtifactPrepareStats {
         workers: 1,
@@ -1304,9 +1462,19 @@ async fn prepare_transform_batches(
             break;
         };
         let column = column.clone();
+        let staging = staging.clone();
+        // `spawn_blocking` also matters for staging: acquiring a slot blocks
+        // the thread until one is free.
         let (prepared, batch_stats) = tokio::task::spawn_blocking(move || {
             let mut batch_stats = ArtifactPrepareStats::default();
-            let prepared = prepare_transform_batch(batch, &column, filter_nan, &mut batch_stats)?;
+            let prepared = prepare_transform_batch(
+                batch,
+                &column,
+                filter_nan,
+                staging.as_ref(),
+                copy_threads,
+                &mut batch_stats,
+            )?;
             Ok::<_, Error>((prepared, batch_stats))
         })
         .await
@@ -1318,6 +1486,10 @@ async fn prepare_transform_batches(
         stats.matrix += batch_stats.matrix;
         stats.register += batch_stats.register;
         stats.registered_bytes += batch_stats.registered_bytes;
+        stats.staging_wait += batch_stats.staging_wait;
+        stats.staging_copy += batch_stats.staging_copy;
+        stats.staged_bytes += batch_stats.staged_bytes;
+        stats.staging_fallbacks += batch_stats.staging_fallbacks;
 
         let Some(prepared) = prepared else {
             continue;
@@ -1365,6 +1537,40 @@ async fn append_transformed_batches_to_artifact(
             prepare_workers
         );
     }
+    let staging = if pinned_staging_enabled_from_env() {
+        // Deadlock floor: the driver loop below only drains a transform slot
+        // (releasing its staging slot) when the next prepared batch arrives.
+        // While it waits for one, the prepared channel is empty and at most
+        // PIPELINE_SLOTS staging slots are held by in-flight transforms, so
+        // one more guarantees some prepare worker can always acquire a slot.
+        let min_slots = PIPELINE_SLOTS + 1;
+        let requested = pinned_staging_slots_from_env(prepare_workers + PIPELINE_SLOTS);
+        let staging_slots = if requested < min_slots {
+            warn!(
+                "LANCE_CUVS_PINNED_STAGING_SLOTS={requested} is below the deadlock-free minimum; using {min_slots}"
+            );
+            min_slots
+        } else {
+            requested
+        };
+        let slot_len = staging_slot_rows(dataset, batch_size) * trained.dimension;
+        let alloc_start = Instant::now();
+        let pool = PinnedStagingPool::try_new(staging_slots, slot_len)?;
+        stats.staging_alloc = alloc_start.elapsed();
+        stats.staging_slots = staging_slots;
+        stats.staging_slot_bytes = slot_len * std::mem::size_of::<f32>();
+        eprintln!(
+            "cuVS artifact prepare: pinned staging enabled: {} slots x {:.1} MiB ({:.2} GiB pinned), allocated in {:.3}s",
+            staging_slots,
+            stats.staging_slot_bytes as f64 / (1024.0 * 1024.0),
+            (staging_slots * stats.staging_slot_bytes) as f64 / (1024.0 * 1024.0 * 1024.0),
+            secs(stats.staging_alloc),
+        );
+        Some(pool)
+    } else {
+        None
+    };
+    let copy_threads = pinned_staging_copy_threads_from_env();
     let (raw_tx, raw_rx) = mpsc::channel::<RecordBatch>(prepare_workers);
     let raw_rx = Arc::new(Mutex::new(raw_rx));
     let scanner_task = tokio::spawn(scan_transform_batches(
@@ -1382,6 +1588,8 @@ async fn append_transformed_batches_to_artifact(
                 filter_nan,
                 raw_rx.clone(),
                 prepared_tx.clone(),
+                staging.clone(),
+                copy_threads,
             ))
         })
         .collect::<Vec<_>>();
