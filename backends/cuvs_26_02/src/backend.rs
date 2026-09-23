@@ -812,7 +812,9 @@ struct ArtifactBuildStats {
     registered_bytes: usize,
     staging_slots: usize,
     staging_slot_bytes: usize,
-    staging_alloc: Duration,
+    // Background allocation time for all slots (off the critical path);
+    // None if it had not finished when the stage ended.
+    staging_alloc: Option<Duration>,
     staging_wait: Duration,
     staging_copy: Duration,
     staged_bytes: usize,
@@ -903,14 +905,18 @@ impl ArtifactBuildStats {
             self.registered_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         );
         if self.staging_slots > 0 {
-            // staging_wait_s: time prepare workers spent blocked waiting for
-            // a free slot (pipeline backpressure, not copy cost).
+            // alloc_s: background allocation of all slots, off the critical
+            // path. wait_s: time prepare workers spent blocked waiting for a
+            // slot -- including, at startup, for the first slots to be
+            // allocated -- so any allocation cost still on the critical path
+            // shows up there, not in alloc_s.
             eprintln!(
-                "cuVS artifact h2d staging: slots={} slot_mib={:.1} pinned_gib={:.3} alloc_s={:.3} wait_s={:.3} copy_s={:.3} staged_gib={:.3} fallbacks={}",
+                "cuVS artifact h2d staging: slots={} slot_mib={:.1} pinned_gib={:.3} alloc_s={} wait_s={:.3} copy_s={:.3} staged_gib={:.3} fallbacks={}",
                 self.staging_slots,
                 self.staging_slot_bytes as f64 / (1024.0 * 1024.0),
                 (self.staging_slots * self.staging_slot_bytes) as f64 / (1024.0 * 1024.0 * 1024.0),
-                secs(self.staging_alloc),
+                self.staging_alloc
+                    .map_or_else(|| "unfinished".to_string(), |alloc| format!("{:.3}", secs(alloc))),
                 secs(self.staging_wait),
                 secs(self.staging_copy),
                 self.staged_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -1360,7 +1366,7 @@ fn prepare_transform_batch(
             Some(pool) if values.len() <= pool.slot_len() => {
                 let stage_span = NvtxSpan::new("cuvs/prepare_stage");
                 let wait_start = Instant::now();
-                let mut slot = pool.acquire();
+                let mut slot = pool.acquire()?;
                 stats.staging_wait += wait_start.elapsed();
                 let copy_start = Instant::now();
                 slot.fill_from(values, copy_threads)?;
@@ -1554,17 +1560,17 @@ async fn append_transformed_batches_to_artifact(
             requested
         };
         let slot_len = staging_slot_rows(dataset, batch_size) * trained.dimension;
-        let alloc_start = Instant::now();
-        let pool = PinnedStagingPool::try_new(staging_slots, slot_len)?;
-        stats.staging_alloc = alloc_start.elapsed();
+        // Returns immediately; slots are allocated on a background thread
+        // and handed out as they become ready, so the scanner's first reads
+        // overlap the allocation instead of waiting for all of it.
+        let pool = PinnedStagingPool::spawn(staging_slots, slot_len)?;
         stats.staging_slots = staging_slots;
         stats.staging_slot_bytes = slot_len * std::mem::size_of::<f32>();
         eprintln!(
-            "cuVS artifact prepare: pinned staging enabled: {} slots x {:.1} MiB ({:.2} GiB pinned), allocated in {:.3}s",
+            "cuVS artifact prepare: pinned staging enabled: {} slots x {:.1} MiB ({:.2} GiB pinned), allocating in the background",
             staging_slots,
             stats.staging_slot_bytes as f64 / (1024.0 * 1024.0),
             (staging_slots * stats.staging_slot_bytes) as f64 / (1024.0 * 1024.0 * 1024.0),
-            secs(stats.staging_alloc),
         );
         Some(pool)
     } else {
@@ -1651,6 +1657,9 @@ async fn append_transformed_batches_to_artifact(
         } else {
             stats.drain += drain_start.elapsed();
         }
+    }
+    if let Some(pool) = &staging {
+        stats.staging_alloc = pool.allocation_time();
     }
     stats.log();
     Ok(())

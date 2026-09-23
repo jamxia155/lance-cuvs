@@ -13,13 +13,19 @@ use ndarray::{Array2, ArrayView2};
 use std::ffi::{CStr, c_void};
 use std::marker::PhantomData;
 use std::ptr;
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 pub(crate) type CudaEventHandle = *mut c_void;
+
+/// `cudaHostAllocPortable`: the allocation counts as pinned in every CUDA
+/// context, not only the one current on the allocating thread.
+const CUDA_HOST_ALLOC_PORTABLE: u32 = 0x01;
 
 #[link(name = "cudart")]
 unsafe extern "C" {
     fn cudaMallocHost(ptr: *mut *mut c_void, size: usize) -> cuvs_sys::cudaError_t;
+    fn cudaHostAlloc(ptr: *mut *mut c_void, size: usize, flags: u32) -> cuvs_sys::cudaError_t;
     fn cudaFreeHost(ptr: *mut c_void) -> cuvs_sys::cudaError_t;
     fn cudaHostRegister(ptr: *mut c_void, size: usize, flags: u32) -> cuvs_sys::cudaError_t;
     fn cudaHostUnregister(ptr: *mut c_void) -> cuvs_sys::cudaError_t;
@@ -406,6 +412,28 @@ impl<T: Copy> PinnedHostBuffer<T> {
         })
     }
 
+    /// Like [`Self::try_new`], but allocated with `cudaHostAllocPortable`, so
+    /// it counts as pinned in every CUDA context. Plain `cudaMallocHost`
+    /// memory is only pinned for the context current on the allocating
+    /// thread; a buffer allocated on a background thread and copied from on
+    /// another would otherwise risk being treated as pageable. Freed by the
+    /// same `cudaFreeHost` in `Drop`.
+    pub(crate) fn try_new_portable(len: usize) -> Result<Self> {
+        let bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| Error::io("pinned host allocation size overflow"))?;
+        let mut raw = ptr::null_mut();
+        check_cuda(
+            unsafe { cudaHostAlloc(&mut raw, bytes, CUDA_HOST_ALLOC_PORTABLE) },
+            "allocate portable pinned host buffer",
+        )?;
+        Ok(Self {
+            ptr: raw.cast::<T>(),
+            len,
+            _marker: PhantomData,
+        })
+    }
+
     pub(crate) fn as_slice(&self) -> &[T] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
@@ -460,25 +488,80 @@ unsafe impl<T: Send> Send for PinnedHostBuffer<T> {}
 /// an already-pinned slot replaces that with a plain memcpy. See
 /// `profiling/PINNED_BUFFER_POOL_DESIGN.md`.
 ///
-/// Slots are only ever allocated here, up front -- never per batch: a
-/// per-batch `cudaMallocHost`/`cudaFreeHost` would put synchronizing CUDA
-/// allocation calls back into the multi-threaded pipeline.
+/// Slots are allocated by a background thread started in [`Self::spawn`],
+/// one at a time, each handed to waiting workers as soon as it exists.
+/// Allocating all of them up front measured ~1.8 s for 10 x 610 MiB and sat
+/// directly on the pipeline's critical path; in the background it overlaps
+/// the scanner's first reads and decodes. Slots are never allocated per
+/// batch: a per-batch `cudaMallocHost`/`cudaFreeHost` would put synchronizing
+/// CUDA allocation calls into the multi-threaded pipeline.
 pub(crate) struct PinnedStagingPool {
-    free: Mutex<Vec<PinnedHostBuffer<f32>>>,
-    returned: Condvar,
+    state: Mutex<PoolState>,
+    // Signalled when a slot is returned, a new slot is allocated, or
+    // allocation fails.
+    changed: Condvar,
     slot_len: usize,
 }
 
+struct PoolState {
+    free: Vec<PinnedHostBuffer<f32>>,
+    alloc_error: Option<String>,
+    // Set once every slot has been allocated.
+    alloc_elapsed: Option<Duration>,
+}
+
 impl PinnedStagingPool {
-    pub(crate) fn try_new(slots: usize, slot_len: usize) -> Result<Arc<Self>> {
-        let free = (0..slots)
-            .map(|_| PinnedHostBuffer::try_new(slot_len))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Arc::new(Self {
-            free: Mutex::new(free),
-            returned: Condvar::new(),
+    /// Returns an empty pool immediately and starts a background thread that
+    /// allocates `slots` buffers of `slot_len` `f32`s each.
+    pub(crate) fn spawn(slots: usize, slot_len: usize) -> Result<Arc<Self>> {
+        let pool = Arc::new(Self {
+            state: Mutex::new(PoolState {
+                free: Vec::with_capacity(slots),
+                alloc_error: None,
+                alloc_elapsed: None,
+            }),
+            changed: Condvar::new(),
             slot_len,
-        }))
+        });
+        let filler = Arc::clone(&pool);
+        std::thread::Builder::new()
+            .name("cuvs-pinned-alloc".to_string())
+            .spawn(move || filler.allocate(slots))
+            .map_err(|error| {
+                Error::io(format!(
+                    "failed to start pinned staging allocation thread: {error}"
+                ))
+            })?;
+        Ok(pool)
+    }
+
+    fn allocate(self: Arc<Self>, slots: usize) {
+        let start = Instant::now();
+        for _ in 0..slots {
+            // Only this thread still holds the pool: the build has finished
+            // or failed, so stop allocating slots nobody will use.
+            if Arc::strong_count(&self) == 1 {
+                return;
+            }
+            match PinnedHostBuffer::<f32>::try_new_portable(self.slot_len) {
+                Ok(buffer) => {
+                    self.lock().free.push(buffer);
+                    self.changed.notify_one();
+                }
+                Err(error) => {
+                    self.lock().alloc_error = Some(error.to_string());
+                    // Wake every waiter so none blocks forever on a slot
+                    // that will never be allocated.
+                    self.changed.notify_all();
+                    return;
+                }
+            }
+        }
+        self.lock().alloc_elapsed = Some(start.elapsed());
+    }
+
+    fn lock(&self) -> MutexGuard<'_, PoolState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Capacity of each slot, in `f32` elements.
@@ -486,23 +569,34 @@ impl PinnedStagingPool {
         self.slot_len
     }
 
-    /// Takes a free slot, blocking until one is returned if none is free.
+    /// How long allocating every slot took, once it has finished.
+    pub(crate) fn allocation_time(&self) -> Option<Duration> {
+        self.lock().alloc_elapsed
+    }
+
+    /// Takes a free slot, blocking until one is returned or allocated. Fails
+    /// if no slot is free and background allocation has failed.
     ///
     /// Blocks the calling OS thread: call it only from a blocking-capable
     /// thread (e.g. inside `spawn_blocking`), never directly on an async task.
-    pub(crate) fn acquire(self: &Arc<Self>) -> PinnedStagingSlot {
-        let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
+    pub(crate) fn acquire(self: &Arc<Self>) -> Result<PinnedStagingSlot> {
+        let mut state = self.lock();
         loop {
-            if let Some(buffer) = free.pop() {
-                return PinnedStagingSlot {
+            if let Some(buffer) = state.free.pop() {
+                return Ok(PinnedStagingSlot {
                     buffer: Some(buffer),
                     len: 0,
                     pool: Arc::clone(self),
-                };
+                });
             }
-            free = self
-                .returned
-                .wait(free)
+            if let Some(error) = &state.alloc_error {
+                return Err(Error::io(format!(
+                    "pinned staging slot allocation failed: {error}"
+                )));
+            }
+            state = self
+                .changed
+                .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
         }
     }
@@ -548,14 +642,8 @@ impl PinnedStagingSlot {
 impl Drop for PinnedStagingSlot {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
-            let mut free = self
-                .pool
-                .free
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            free.push(buffer);
-            drop(free);
-            self.pool.returned.notify_one();
+            self.pool.lock().free.push(buffer);
+            self.pool.changed.notify_one();
         }
     }
 }
