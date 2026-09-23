@@ -271,17 +271,10 @@ impl<T: DlElement> DeviceTensor<T> {
         self.current_len() * std::mem::size_of::<T>()
     }
 
-    pub(crate) fn copy_from_host_async(&mut self, resources: &Resources, src: &[T]) -> Result<()> {
-        let stream = resources
-            .get_cuda_stream()
-            .map_err(|e| Error::io(e.to_string()))?;
-        self.copy_from_host_async_on(stream, src)
-    }
-
-    /// Like [`Self::copy_from_host_async`], but on an explicit stream, e.g. a
-    /// dedicated copy stream so the copy can overlap kernels on the compute
-    /// stream. The source must stay alive (and, for the copy to be truly
-    /// asynchronous, pinned) until the copy completes.
+    /// Enqueues a host-to-device copy of `src` on `stream` -- the compute
+    /// stream, or a dedicated copy stream so the copy can overlap kernels on
+    /// the compute stream. The source must stay alive (and, for the copy to be
+    /// truly asynchronous, pinned) until the copy completes.
     pub(crate) fn copy_from_host_async_on(
         &mut self,
         stream: cuvs_sys::cudaStream_t,
