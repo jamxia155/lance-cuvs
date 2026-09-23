@@ -53,7 +53,21 @@ unsafe extern "C" {
     ) -> cuvs_sys::cudaError_t;
     fn cudaProfilerStart() -> cuvs_sys::cudaError_t;
     fn cudaProfilerStop() -> cuvs_sys::cudaError_t;
+    fn cudaStreamCreateWithFlags(
+        stream: *mut cuvs_sys::cudaStream_t,
+        flags: u32,
+    ) -> cuvs_sys::cudaError_t;
+    fn cudaStreamDestroy(stream: cuvs_sys::cudaStream_t) -> cuvs_sys::cudaError_t;
+    fn cudaStreamWaitEvent(
+        stream: cuvs_sys::cudaStream_t,
+        event: CudaEventHandle,
+        flags: u32,
+    ) -> cuvs_sys::cudaError_t;
 }
+
+/// `cudaStreamNonBlocking`: no implicit synchronization with the legacy
+/// default stream.
+const CUDA_STREAM_NON_BLOCKING: u32 = 0x01;
 
 /// Start `nsys`/`nvprof` capture when run under `--capture-range=cudaProfilerApi`.
 /// A no-op outside that mode.
@@ -258,6 +272,21 @@ impl<T: DlElement> DeviceTensor<T> {
     }
 
     pub(crate) fn copy_from_host_async(&mut self, resources: &Resources, src: &[T]) -> Result<()> {
+        let stream = resources
+            .get_cuda_stream()
+            .map_err(|e| Error::io(e.to_string()))?;
+        self.copy_from_host_async_on(stream, src)
+    }
+
+    /// Like [`Self::copy_from_host_async`], but on an explicit stream, e.g. a
+    /// dedicated copy stream so the copy can overlap kernels on the compute
+    /// stream. The source must stay alive (and, for the copy to be truly
+    /// asynchronous, pinned) until the copy completes.
+    pub(crate) fn copy_from_host_async_on(
+        &mut self,
+        stream: cuvs_sys::cudaStream_t,
+        src: &[T],
+    ) -> Result<()> {
         let expected_len = self.current_len();
         if src.len() != expected_len {
             return Err(Error::io(format!(
@@ -272,9 +301,7 @@ impl<T: DlElement> DeviceTensor<T> {
                     src.as_ptr() as *const _,
                     self.current_bytes(),
                     cuvs_sys::cudaMemcpyKind_cudaMemcpyDefault,
-                    resources
-                        .get_cuda_stream()
-                        .map_err(|e| Error::io(e.to_string()))?,
+                    stream,
                 )
             },
             "copy host tensor to device",
@@ -670,6 +697,34 @@ fn parallel_copy<T: Copy + Send + Sync>(dst: &mut [T], src: &[T], threads: usize
     });
 }
 
+/// An owned, non-blocking CUDA stream on the current device.
+pub(crate) struct CudaStream {
+    raw: cuvs_sys::cudaStream_t,
+}
+
+impl CudaStream {
+    pub(crate) fn try_new_non_blocking() -> Result<Self> {
+        let mut raw = ptr::null_mut();
+        check_cuda(
+            unsafe { cudaStreamCreateWithFlags(&mut raw, CUDA_STREAM_NON_BLOCKING) },
+            "create CUDA stream",
+        )?;
+        Ok(Self { raw })
+    }
+
+    pub(crate) fn raw(&self) -> cuvs_sys::cudaStream_t {
+        self.raw
+    }
+}
+
+impl Drop for CudaStream {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            let _ = unsafe { cudaStreamDestroy(self.raw) };
+        }
+    }
+}
+
 pub(crate) struct CudaEvent {
     raw: CudaEventHandle,
 }
@@ -692,6 +747,16 @@ impl CudaEvent {
         check_cuda(
             unsafe { cudaEventSynchronize(self.raw) },
             "synchronize CUDA event",
+        )
+    }
+
+    /// Makes future work on `stream` wait until this event has completed,
+    /// without blocking the host. A no-op ordering-wise when the event was
+    /// recorded on `stream` itself.
+    pub(crate) fn make_stream_wait(&self, stream: cuvs_sys::cudaStream_t) -> Result<()> {
+        check_cuda(
+            unsafe { cudaStreamWaitEvent(stream, self.raw, 0) },
+            "make stream wait on CUDA event",
         )
     }
 
