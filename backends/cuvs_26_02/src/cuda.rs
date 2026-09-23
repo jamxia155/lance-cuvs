@@ -10,7 +10,8 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use ndarray::{Array2, ArrayView2};
-use std::ffi::{CStr, c_void};
+use std::collections::BTreeMap;
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::marker::PhantomData;
 use std::ptr;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -392,6 +393,199 @@ impl Drop for RegisteredHostBuffer {
         if !self.ptr.is_null() {
             let _ = unsafe { cudaHostUnregister(self.ptr) };
         }
+    }
+}
+
+/// Outcome of [`RegistrationCache::lookup_or_register`].
+pub(crate) enum CacheLookup {
+    /// The buffer already lies inside a range registered earlier in this
+    /// stage: no CUDA call was made.
+    Hit,
+    /// The buffer's page-rounded range was registered now and is kept until
+    /// [`RegistrationCache::unregister_all`].
+    Registered { bytes: usize },
+    /// The range partly overlaps a registered (or in-progress) range, so it
+    /// cannot be registered safely; copy this batch from pageable memory.
+    Overlap,
+    /// `cudaHostRegister` failed; copy this batch from pageable memory.
+    Failed,
+}
+
+struct CachedRange {
+    end: usize,
+    // False while `cudaHostRegister` for this range is still in progress on
+    // another thread.
+    ready: bool,
+}
+
+/// Keeps host memory registered with CUDA across batches instead of
+/// registering and unregistering every batch's decoded buffer.
+///
+/// Per-batch `cudaHostRegister`/`cudaHostUnregister` costs ~2.5-4 s per scan
+/// stage and, with transform overlap on, contends with the transform itself
+/// (`transform_s` 5.3 s vs 4.0 s without registration). With a retaining
+/// allocator, later batches land in memory that earlier batches already
+/// used, so each region only needs registering once.
+///
+/// **Only safe if freed memory is never returned to the OS during the
+/// stage.** If a registered range were unmapped and the same virtual
+/// addresses later handed out again with different physical pages, lookups
+/// would still hit and the GPU would DMA from the stale pinned pages --
+/// silently wrong data. Enable it only after
+/// [`jemalloc_never_releases_memory`] succeeds.
+pub(crate) struct RegistrationCache {
+    ranges: Mutex<BTreeMap<usize, CachedRange>>,
+}
+
+impl RegistrationCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            ranges: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<usize, CachedRange>> {
+        self.ranges.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Does any existing or in-progress range intersect `[start, end)`?
+    fn overlaps(ranges: &BTreeMap<usize, CachedRange>, start: usize, end: usize) -> bool {
+        if let Some((_, range)) = ranges.range(..start).next_back() {
+            if range.end > start {
+                return true;
+            }
+        }
+        ranges.range(start..end).next().is_some()
+    }
+
+    pub(crate) fn lookup_or_register<T>(&self, slice: &[T]) -> Result<CacheLookup> {
+        let bytes = std::mem::size_of_val(slice);
+        if bytes == 0 {
+            return Ok(CacheLookup::Hit);
+        }
+        let page_size = page_size()?;
+        let start = slice.as_ptr() as usize;
+        let end = start
+            .checked_add(bytes)
+            .ok_or_else(|| Error::io("registration cache range overflow"))?;
+        let aligned_start = start & !(page_size - 1);
+        let aligned_end = end
+            .checked_add(page_size - 1)
+            .ok_or_else(|| Error::io("registration cache alignment overflow"))?
+            & !(page_size - 1);
+        {
+            let mut ranges = self.lock();
+            if let Some((_, range)) = ranges.range(..=start).next_back() {
+                if range.ready && range.end >= end {
+                    return Ok(CacheLookup::Hit);
+                }
+            }
+            if Self::overlaps(&ranges, aligned_start, aligned_end) {
+                return Ok(CacheLookup::Overlap);
+            }
+            // Claim the range, then register without holding the lock so
+            // other workers' lookups don't queue behind a slow registration.
+            ranges.insert(
+                aligned_start,
+                CachedRange {
+                    end: aligned_end,
+                    ready: false,
+                },
+            );
+        }
+        let status = unsafe {
+            cudaHostRegister(
+                aligned_start as *mut c_void,
+                aligned_end - aligned_start,
+                0,
+            )
+        };
+        let mut ranges = self.lock();
+        if status == cuvs_sys::cudaError::cudaSuccess {
+            if let Some(range) = ranges.get_mut(&aligned_start) {
+                range.ready = true;
+            }
+            Ok(CacheLookup::Registered {
+                bytes: aligned_end - aligned_start,
+            })
+        } else {
+            // cudaHostRegister errors are not sticky; nothing else to clear.
+            ranges.remove(&aligned_start);
+            Ok(CacheLookup::Failed)
+        }
+    }
+
+    /// Unregisters every range. Call only once no copy can still be reading
+    /// from any of them. Returns (ranges, bytes).
+    pub(crate) fn unregister_all(&self) -> (usize, usize) {
+        let mut ranges = self.lock();
+        let mut count = 0;
+        let mut bytes = 0;
+        for (start, range) in ranges.iter() {
+            if range.ready {
+                let _ = unsafe { cudaHostUnregister(*start as *mut c_void) };
+                count += 1;
+                bytes += range.end - start;
+            }
+        }
+        ranges.clear();
+        (count, bytes)
+    }
+}
+
+impl Drop for RegistrationCache {
+    fn drop(&mut self) {
+        self.unregister_all();
+    }
+}
+
+type Mallctl =
+    unsafe extern "C" fn(*const c_char, *mut c_void, *mut usize, *mut c_void, usize) -> c_int;
+
+fn mallctl_read<T: Copy + Default>(mallctl: Mallctl, name: &CStr) -> Option<T> {
+    let mut value = T::default();
+    let mut len = std::mem::size_of::<T>();
+    let rc = unsafe {
+        mallctl(
+            name.as_ptr(),
+            (&mut value as *mut T).cast::<c_void>(),
+            &mut len,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && len == std::mem::size_of::<T>()).then_some(value)
+}
+
+/// Checks that the process allocator is jemalloc configured never to give
+/// freed memory back to the OS during the run -- the precondition for
+/// [`RegistrationCache`]. Reads the live settings through jemalloc's
+/// `mallctl` rather than trusting environment variables: requires
+/// `opt.retain` (no `munmap` of freed extents), `opt.dirty_decay_ms` and
+/// `opt.muzzy_decay_ms` of -1 (no purging, so no `madvise` that would detach
+/// pinned physical pages from their virtual addresses), and
+/// `opt.oversize_threshold` of 0 (no separate oversize arena with its own
+/// purging). Returns why not, otherwise.
+pub(crate) fn jemalloc_never_releases_memory() -> std::result::Result<(), String> {
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mallctl".as_ptr()) };
+    if symbol.is_null() {
+        return Err("jemalloc is not loaded (no `mallctl` symbol in the process); \
+                    glibc unmaps large freed buffers"
+            .to_string());
+    }
+    let mallctl: Mallctl = unsafe { std::mem::transmute(symbol) };
+    let retain = mallctl_read::<bool>(mallctl, c"opt.retain");
+    let dirty = mallctl_read::<isize>(mallctl, c"opt.dirty_decay_ms");
+    let muzzy = mallctl_read::<isize>(mallctl, c"opt.muzzy_decay_ms");
+    let oversize = mallctl_read::<usize>(mallctl, c"opt.oversize_threshold");
+    match (retain, dirty, muzzy, oversize) {
+        (Some(true), Some(-1), Some(-1), Some(0)) => Ok(()),
+        _ => Err(format!(
+            "jemalloc may return memory to the OS (opt.retain={retain:?}, \
+             opt.dirty_decay_ms={dirty:?}, opt.muzzy_decay_ms={muzzy:?}, \
+             opt.oversize_threshold={oversize:?}); set MALLOC_CONF=\
+             dirty_decay_ms:-1,muzzy_decay_ms:-1,oversize_threshold:0 (retain is the Linux default)"
+        )),
     }
 }
 

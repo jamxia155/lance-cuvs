@@ -2,8 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::cuda::{
-    CudaEvent, CudaStream, CuvsIvfPqIndex, DeviceTensor, HostTensorView, MatrixBuffer,
-    PinnedHostBuffer, PinnedStagingPool, PinnedStagingSlot, RegisteredHostBuffer, check_cuvs,
+    CacheLookup, CudaEvent, CudaStream, CuvsIvfPqIndex, DeviceTensor, HostTensorView,
+    MatrixBuffer, PinnedHostBuffer, PinnedStagingPool, PinnedStagingSlot, RegisteredHostBuffer,
+    RegistrationCache, check_cuvs, jemalloc_never_releases_memory,
     copy_tensor_to_host_f32_2d, copy_tensor_to_host_f32_3d, create_index_params,
     cuda_profiler_start, cuda_profiler_stop, destroy_index_params, enable_rmm_pool_from_env,
     ivf_centroids_from_host, make_tensor_view, matrix_from_vectors, pq_codebook_from_host,
@@ -580,6 +581,10 @@ struct ArtifactPrepareStats {
     // Batches that did not fit a staging slot and were copied to the GPU
     // from pageable memory instead.
     staging_fallbacks: usize,
+    cache_hits: usize,
+    cache_registrations: usize,
+    cache_overlap_misses: usize,
+    cache_failures: usize,
 }
 
 impl TransformSlot {
@@ -885,6 +890,14 @@ struct ArtifactBuildStats {
     staging_copy: Duration,
     staged_bytes: usize,
     staging_fallbacks: usize,
+    cache_enabled: bool,
+    cache_hits: usize,
+    cache_registrations: usize,
+    cache_overlap_misses: usize,
+    cache_failures: usize,
+    cache_ranges: usize,
+    cache_pinned_bytes: usize,
+    cache_unregister: Duration,
 }
 
 impl ArtifactBuildStats {
@@ -912,6 +925,10 @@ impl ArtifactBuildStats {
         self.staging_copy += prepare.staging_copy;
         self.staged_bytes += prepare.staged_bytes;
         self.staging_fallbacks += prepare.staging_fallbacks;
+        self.cache_hits += prepare.cache_hits;
+        self.cache_registrations += prepare.cache_registrations;
+        self.cache_overlap_misses += prepare.cache_overlap_misses;
+        self.cache_failures += prepare.cache_failures;
     }
 
     fn record_output(&mut self, batch: &RecordBatch) {
@@ -1008,6 +1025,20 @@ impl ArtifactBuildStats {
                 self.staging_fallbacks,
             );
         }
+        if self.cache_enabled {
+            // register_s above includes cache lookups and the new
+            // registrations; registered_gib counts newly registered bytes.
+            eprintln!(
+                "cuVS artifact registration cache: hits={} new_registrations={} overlap_misses={} failures={} ranges={} pinned_gib={:.3} unregister_s={:.3}",
+                self.cache_hits,
+                self.cache_registrations,
+                self.cache_overlap_misses,
+                self.cache_failures,
+                self.cache_ranges,
+                self.cache_pinned_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                secs(self.cache_unregister),
+            );
+        }
         eprintln!(
             "cuVS artifact gpu events: h2d_s={:.3} transform_s={:.3} d2h_s={:.3}",
             secs(self.gpu_h2d),
@@ -1095,6 +1126,18 @@ fn scan_fragment_readahead_from_env() -> usize {
 fn transform_overlap_enabled_from_env() -> bool {
     matches!(
         std::env::var("LANCE_CUVS_TRANSFORM_OVERLAP").ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// `LANCE_CUVS_REGISTRATION_CACHE=1` (or `true`): keep host memory registered
+/// with CUDA across batches instead of registering/unregistering each
+/// batch's decoded buffer. Enabled only if the allocator is verified never to
+/// return memory to the OS (see `RegistrationCache`); ignored when pinned
+/// staging is on, since staging does not register decoded buffers at all.
+fn registration_cache_enabled_from_env() -> bool {
+    matches!(
+        std::env::var("LANCE_CUVS_REGISTRATION_CACHE").ok().as_deref(),
         Some("1") | Some("true")
     )
 }
@@ -1385,6 +1428,7 @@ fn prepare_transform_batch(
     filter_nan: bool,
     staging: Option<&Arc<PinnedStagingPool>>,
     copy_threads: usize,
+    registration_cache: Option<&Arc<RegistrationCache>>,
     stats: &mut ArtifactPrepareStats,
 ) -> Result<Option<PreparedTransformBatch>> {
     stats.input_batches += 1;
@@ -1509,6 +1553,35 @@ fn prepare_transform_batch(
                     None,
                 )
             }
+            None if registration_cache.is_some() => {
+                let cache = registration_cache.expect("checked by the match guard");
+                let register_span = NvtxSpan::new("cuvs/prepare_register_cached");
+                let register_start = Instant::now();
+                match cache.lookup_or_register(values)? {
+                    CacheLookup::Hit => stats.cache_hits += 1,
+                    CacheLookup::Registered { bytes } => {
+                        stats.cache_registrations += 1;
+                        stats.registered_bytes += bytes;
+                    }
+                    // The batch is copied from pageable memory; correct, just
+                    // not asynchronous.
+                    CacheLookup::Overlap => stats.cache_overlap_misses += 1,
+                    CacheLookup::Failed => stats.cache_failures += 1,
+                }
+                stats.register += register_start.elapsed();
+                drop(register_span);
+                // Nothing per-batch to release: the cache owns registrations
+                // until the end of the stage.
+                (
+                    PreparedMatrix::F32Arrow {
+                        vectors: filtered_vectors,
+                        rows,
+                        dimension: cols,
+                    },
+                    None,
+                    None,
+                )
+            }
             None => {
                 let register_span = NvtxSpan::new("cuvs/prepare_register");
                 let register_start = Instant::now();
@@ -1556,6 +1629,7 @@ async fn prepare_transform_batches(
     mut prepared_tx: mpsc::Sender<PreparedTransformBatch>,
     staging: Option<Arc<PinnedStagingPool>>,
     copy_threads: usize,
+    registration_cache: Option<Arc<RegistrationCache>>,
 ) -> Result<ArtifactPrepareStats> {
     let mut stats = ArtifactPrepareStats {
         workers: 1,
@@ -1575,6 +1649,7 @@ async fn prepare_transform_batches(
         };
         let column = column.clone();
         let staging = staging.clone();
+        let registration_cache = registration_cache.clone();
         // `spawn_blocking` also matters for staging: acquiring a slot blocks
         // the thread until one is free.
         let (prepared, batch_stats) = tokio::task::spawn_blocking(move || {
@@ -1585,6 +1660,7 @@ async fn prepare_transform_batches(
                 filter_nan,
                 staging.as_ref(),
                 copy_threads,
+                registration_cache.as_ref(),
                 &mut batch_stats,
             )?;
             Ok::<_, Error>((prepared, batch_stats))
@@ -1602,6 +1678,10 @@ async fn prepare_transform_batches(
         stats.staging_copy += batch_stats.staging_copy;
         stats.staged_bytes += batch_stats.staged_bytes;
         stats.staging_fallbacks += batch_stats.staging_fallbacks;
+        stats.cache_hits += batch_stats.cache_hits;
+        stats.cache_registrations += batch_stats.cache_registrations;
+        stats.cache_overlap_misses += batch_stats.cache_overlap_misses;
+        stats.cache_failures += batch_stats.cache_failures;
 
         let Some(prepared) = prepared else {
             continue;
@@ -1697,6 +1777,30 @@ async fn append_transformed_batches_to_artifact(
         None
     };
     let copy_threads = pinned_staging_copy_threads_from_env();
+    let registration_cache = if !registration_cache_enabled_from_env() {
+        None
+    } else if staging.is_some() {
+        eprintln!(
+            "cuVS artifact prepare: LANCE_CUVS_REGISTRATION_CACHE ignored: pinned staging is on and does not register decoded buffers"
+        );
+        None
+    } else {
+        match jemalloc_never_releases_memory() {
+            Ok(()) => {
+                eprintln!(
+                    "cuVS artifact prepare: registration cache enabled (jemalloc retains freed memory)"
+                );
+                stats.cache_enabled = true;
+                Some(Arc::new(RegistrationCache::new()))
+            }
+            Err(reason) => {
+                eprintln!(
+                    "cuVS artifact prepare: LANCE_CUVS_REGISTRATION_CACHE ignored, registering per batch instead: {reason}"
+                );
+                None
+            }
+        }
+    };
     let (raw_tx, raw_rx) = mpsc::channel::<RecordBatch>(prepare_workers);
     let raw_rx = Arc::new(Mutex::new(raw_rx));
     let scanner_task = tokio::spawn(scan_transform_batches(
@@ -1716,6 +1820,7 @@ async fn append_transformed_batches_to_artifact(
                 prepared_tx.clone(),
                 staging.clone(),
                 copy_threads,
+                registration_cache.clone(),
             ))
         })
         .collect::<Vec<_>>();
@@ -1809,6 +1914,15 @@ async fn append_transformed_batches_to_artifact(
     }
     if let Some(pool) = &staging {
         stats.staging_alloc = pool.allocation_time();
+    }
+    // Every slot has been drained (all H2D copies complete) and every prepare
+    // task has finished, so nothing can still read from a cached range.
+    if let Some(cache) = &registration_cache {
+        let unregister_start = Instant::now();
+        let (ranges, bytes) = cache.unregister_all();
+        stats.cache_unregister = unregister_start.elapsed();
+        stats.cache_ranges = ranges;
+        stats.cache_pinned_bytes = bytes;
     }
     stats.log();
     Ok(())
