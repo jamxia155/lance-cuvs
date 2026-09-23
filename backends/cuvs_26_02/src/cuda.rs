@@ -302,6 +302,61 @@ impl<T: DlElement> DeviceTensor<T> {
         )
     }
 
+    /// Like [`Self::copy_from_host_async_on`], but issued as one copy per
+    /// segment. `segments` are byte ranges relative to `src`'s start that
+    /// must tile `[0, size_of_val(src))` in order. Used when `src` spans more
+    /// than one host registration (see [`RegistrationCache::cover`]): with
+    /// unified addressing CUDA resolves a host source by its start address
+    /// and rejects (`cudaErrorInvalidValue`) a copy that starts inside one
+    /// registered range and runs past its end, so each copy must stay within
+    /// a single registration, or entirely outside any.
+    pub(crate) fn copy_segments_from_host_async_on(
+        &mut self,
+        stream: cuvs_sys::cudaStream_t,
+        src: &[T],
+        segments: &[std::ops::Range<usize>],
+    ) -> Result<()> {
+        let expected_len = self.current_len();
+        if src.len() != expected_len {
+            return Err(Error::io(format!(
+                "device tensor copy expects {expected_len} elements, got {}",
+                src.len()
+            )));
+        }
+        let total = self.current_bytes();
+        let mut cursor = 0usize;
+        for segment in segments {
+            if segment.start != cursor || segment.end < segment.start || segment.end > total {
+                return Err(Error::io(format!(
+                    "copy segments do not tile the {total}-byte source: {segments:?}"
+                )));
+            }
+            cursor = segment.end;
+        }
+        if cursor != total {
+            return Err(Error::io(format!(
+                "copy segments do not tile the {total}-byte source: {segments:?}"
+            )));
+        }
+        let dst = self.tensor.dl_tensor.data.cast::<u8>();
+        let src_bytes = src.as_ptr().cast::<u8>();
+        for segment in segments {
+            check_cuda(
+                unsafe {
+                    cuvs_sys::cudaMemcpyAsync(
+                        dst.add(segment.start).cast(),
+                        src_bytes.add(segment.start).cast(),
+                        segment.end - segment.start,
+                        cuvs_sys::cudaMemcpyKind_cudaMemcpyDefault,
+                        stream,
+                    )
+                },
+                "copy host tensor segment to device",
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn copy_to_host_async(&self, resources: &Resources, dst: &mut [T]) -> Result<()> {
         let expected_len = self.current_len();
         if dst.len() != expected_len {
@@ -396,26 +451,17 @@ impl Drop for RegisteredHostBuffer {
     }
 }
 
-/// Outcome of [`RegistrationCache::lookup_or_register`].
-pub(crate) enum CacheLookup {
-    /// The buffer already lies inside a range registered earlier in this
-    /// stage: no CUDA call was made.
-    Hit,
-    /// The buffer's page-rounded range was registered now and is kept until
-    /// [`RegistrationCache::unregister_all`].
-    Registered { bytes: usize },
-    /// The range partly overlaps a registered (or in-progress) range, so it
-    /// cannot be registered safely; copy this batch from pageable memory.
-    Overlap,
-    /// `cudaHostRegister` failed; copy this batch from pageable memory.
-    Failed,
-}
-
-struct CachedRange {
-    end: usize,
-    // False while `cudaHostRegister` for this range is still in progress on
-    // another thread.
-    ready: bool,
+/// Result of [`RegistrationCache::cover`].
+pub(crate) struct CacheCover {
+    /// Byte ranges relative to the buffer's start, tiling it in order. Each
+    /// lies entirely within one registered range or entirely outside any, so
+    /// one H2D copy per segment is valid. Usually a single segment.
+    pub(crate) segments: Vec<std::ops::Range<usize>>,
+    pub(crate) new_registrations: usize,
+    pub(crate) new_bytes: usize,
+    /// Gaps whose `cudaHostRegister` failed; their segments are copied from
+    /// pageable memory (valid, since they lie outside every registration).
+    pub(crate) failed_gaps: usize,
 }
 
 /// Keeps host memory registered with CUDA across batches instead of
@@ -423,18 +469,27 @@ struct CachedRange {
 ///
 /// Per-batch `cudaHostRegister`/`cudaHostUnregister` costs ~2.5-4 s per scan
 /// stage and, with transform overlap on, contends with the transform itself
-/// (`transform_s` 5.3 s vs 4.0 s without registration). With a retaining
-/// allocator, later batches land in memory that earlier batches already
-/// used, so each region only needs registering once.
+/// (`transform_s` ~5.3 s vs ~4.2 s with this cache). Measured, most of the
+/// gain comes from never unregistering during the stage, not from reuse:
+/// only ~15-23 of 64 batches land entirely inside earlier registrations.
+///
+/// Registered ranges are page-aligned and never overlap. For each buffer,
+/// [`Self::cover`] registers only the parts of its page-aligned range not
+/// already covered, and splits the buffer into copy segments at registration
+/// boundaries. That split is required, not an optimization: with unified
+/// addressing CUDA resolves a host source by its start address, so a single
+/// copy that starts inside one registration and runs past its end fails with
+/// `cudaErrorInvalidValue` (observed with an earlier version that copied such
+/// buffers from pageable memory in one piece).
 ///
 /// **Only safe if freed memory is never returned to the OS during the
 /// stage.** If a registered range were unmapped and the same virtual
-/// addresses later handed out again with different physical pages, lookups
-/// would still hit and the GPU would DMA from the stale pinned pages --
-/// silently wrong data. Enable it only after
-/// [`jemalloc_never_releases_memory`] succeeds.
+/// addresses later handed out again with different physical pages, the
+/// GPU would DMA from the stale pinned pages -- silently wrong data. Enable
+/// it only after [`jemalloc_never_releases_memory`] succeeds.
 pub(crate) struct RegistrationCache {
-    ranges: Mutex<BTreeMap<usize, CachedRange>>,
+    // start -> end of each registered, page-aligned range.
+    ranges: Mutex<BTreeMap<usize, usize>>,
 }
 
 impl RegistrationCache {
@@ -444,24 +499,24 @@ impl RegistrationCache {
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, BTreeMap<usize, CachedRange>> {
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<usize, usize>> {
         self.ranges.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Does any existing or in-progress range intersect `[start, end)`?
-    fn overlaps(ranges: &BTreeMap<usize, CachedRange>, start: usize, end: usize) -> bool {
-        if let Some((_, range)) = ranges.range(..start).next_back() {
-            if range.end > start {
-                return true;
-            }
-        }
-        ranges.range(start..end).next().is_some()
-    }
-
-    pub(crate) fn lookup_or_register<T>(&self, slice: &[T]) -> Result<CacheLookup> {
+    /// Registers whatever part of `slice`'s pages is not yet registered and
+    /// returns how to copy it. Holds the lock across `cudaHostRegister`:
+    /// simpler than tracking in-progress ranges (which could otherwise
+    /// produce exactly the partial overlaps this must avoid), and cheap in
+    /// practice since registrations already serialize inside the driver.
+    pub(crate) fn cover<T>(&self, slice: &[T]) -> Result<CacheCover> {
         let bytes = std::mem::size_of_val(slice);
         if bytes == 0 {
-            return Ok(CacheLookup::Hit);
+            return Ok(CacheCover {
+                segments: vec![0..0],
+                new_registrations: 0,
+                new_bytes: 0,
+                failed_gaps: 0,
+            });
         }
         let page_size = page_size()?;
         let start = slice.as_ptr() as usize;
@@ -473,61 +528,81 @@ impl RegistrationCache {
             .checked_add(page_size - 1)
             .ok_or_else(|| Error::io("registration cache alignment overflow"))?
             & !(page_size - 1);
-        {
-            let mut ranges = self.lock();
-            if let Some((_, range)) = ranges.range(..=start).next_back() {
-                if range.ready && range.end >= end {
-                    return Ok(CacheLookup::Hit);
-                }
-            }
-            if Self::overlaps(&ranges, aligned_start, aligned_end) {
-                return Ok(CacheLookup::Overlap);
-            }
-            // Claim the range, then register without holding the lock so
-            // other workers' lookups don't queue behind a slow registration.
-            ranges.insert(
-                aligned_start,
-                CachedRange {
-                    end: aligned_end,
-                    ready: false,
-                },
-            );
-        }
-        let status = unsafe {
-            cudaHostRegister(
-                aligned_start as *mut c_void,
-                aligned_end - aligned_start,
-                0,
-            )
-        };
+
         let mut ranges = self.lock();
-        if status == cuvs_sys::cudaError::cudaSuccess {
-            if let Some(range) = ranges.get_mut(&aligned_start) {
-                range.ready = true;
+        // Registered ranges intersecting [aligned_start, aligned_end).
+        let mut registered: Vec<(usize, usize)> = Vec::new();
+        if let Some((&range_start, &range_end)) = ranges.range(..aligned_start).next_back() {
+            if range_end > aligned_start {
+                registered.push((range_start, range_end));
             }
-            Ok(CacheLookup::Registered {
-                bytes: aligned_end - aligned_start,
-            })
-        } else {
-            // cudaHostRegister errors are not sticky; nothing else to clear.
-            ranges.remove(&aligned_start);
-            Ok(CacheLookup::Failed)
         }
+        registered.extend(
+            ranges
+                .range(aligned_start..aligned_end)
+                .map(|(&range_start, &range_end)| (range_start, range_end)),
+        );
+        // Uncovered gaps, page-aligned since every range is.
+        let mut gaps = Vec::new();
+        let mut cursor = aligned_start;
+        for &(range_start, range_end) in &registered {
+            if range_start > cursor {
+                gaps.push((cursor, range_start));
+            }
+            cursor = cursor.max(range_end);
+        }
+        if cursor < aligned_end {
+            gaps.push((cursor, aligned_end));
+        }
+
+        let mut cover = CacheCover {
+            segments: Vec::new(),
+            new_registrations: 0,
+            new_bytes: 0,
+            failed_gaps: 0,
+        };
+        for (gap_start, gap_end) in gaps {
+            let status =
+                unsafe { cudaHostRegister(gap_start as *mut c_void, gap_end - gap_start, 0) };
+            if status == cuvs_sys::cudaError::cudaSuccess {
+                ranges.insert(gap_start, gap_end);
+                registered.push((gap_start, gap_end));
+                cover.new_registrations += 1;
+                cover.new_bytes += gap_end - gap_start;
+            } else {
+                // Not sticky; this gap stays unregistered and its segment is
+                // copied from pageable memory.
+                cover.failed_gaps += 1;
+            }
+        }
+        drop(ranges);
+
+        // Split at every registration boundary strictly inside the buffer.
+        let mut cuts: Vec<usize> = registered
+            .iter()
+            .flat_map(|&(range_start, range_end)| [range_start, range_end])
+            .filter(|&cut| cut > start && cut < end)
+            .collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut previous = start;
+        for cut in cuts.into_iter().chain(std::iter::once(end)) {
+            cover.segments.push((previous - start)..(cut - start));
+            previous = cut;
+        }
+        Ok(cover)
     }
 
     /// Unregisters every range. Call only once no copy can still be reading
     /// from any of them. Returns (ranges, bytes).
     pub(crate) fn unregister_all(&self) -> (usize, usize) {
         let mut ranges = self.lock();
-        let mut count = 0;
         let mut bytes = 0;
-        for (start, range) in ranges.iter() {
-            if range.ready {
-                let _ = unsafe { cudaHostUnregister(*start as *mut c_void) };
-                count += 1;
-                bytes += range.end - start;
-            }
+        for (&range_start, &range_end) in ranges.iter() {
+            let _ = unsafe { cudaHostUnregister(range_start as *mut c_void) };
+            bytes += range_end - range_start;
         }
+        let count = ranges.len();
         ranges.clear();
         (count, bytes)
     }

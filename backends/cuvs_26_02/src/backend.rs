@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::cuda::{
-    CacheLookup, CudaEvent, CudaStream, CuvsIvfPqIndex, DeviceTensor, HostTensorView,
+    CudaEvent, CudaStream, CuvsIvfPqIndex, DeviceTensor, HostTensorView,
     MatrixBuffer, PinnedHostBuffer, PinnedStagingPool, PinnedStagingSlot, RegisteredHostBuffer,
     RegistrationCache, check_cuvs, jemalloc_never_releases_memory,
     copy_tensor_to_host_f32_2d, copy_tensor_to_host_f32_3d, create_index_params,
@@ -534,6 +534,10 @@ struct PreparedTransformBatch {
     matrix: PreparedMatrix,
     input_registration: Option<RegisteredHostBuffer>,
     input_staging: Option<PinnedStagingSlot>,
+    // Set by the registration cache when the input spans more than one
+    // registration: byte ranges to copy separately (see
+    // `RegistrationCache::cover`). `None` means one copy.
+    copy_segments: Option<Vec<std::ops::Range<usize>>>,
 }
 
 struct DrainedTransformBatch {
@@ -583,8 +587,8 @@ struct ArtifactPrepareStats {
     staging_fallbacks: usize,
     cache_hits: usize,
     cache_registrations: usize,
-    cache_overlap_misses: usize,
-    cache_failures: usize,
+    cache_split_copies: usize,
+    cache_failed_gaps: usize,
 }
 
 impl TransformSlot {
@@ -672,8 +676,16 @@ impl TransformSlot {
 
         self.h2d_start.record(copy_stream)?;
         let h2d_enqueue_start = Instant::now();
-        self.input_device
-            .copy_from_host_async_on(copy_stream, input_slice)?;
+        match &prepared.copy_segments {
+            Some(segments) => self.input_device.copy_segments_from_host_async_on(
+                copy_stream,
+                input_slice,
+                segments,
+            )?,
+            None => self
+                .input_device
+                .copy_from_host_async_on(copy_stream, input_slice)?,
+        }
         timings.h2d_enqueue += h2d_enqueue_start.elapsed();
         self.h2d_done.record(copy_stream)?;
         // Keep the host inputs (registration, staging slot, decoded buffer)
@@ -893,8 +905,8 @@ struct ArtifactBuildStats {
     cache_enabled: bool,
     cache_hits: usize,
     cache_registrations: usize,
-    cache_overlap_misses: usize,
-    cache_failures: usize,
+    cache_split_copies: usize,
+    cache_failed_gaps: usize,
     cache_ranges: usize,
     cache_pinned_bytes: usize,
     cache_unregister: Duration,
@@ -927,8 +939,8 @@ impl ArtifactBuildStats {
         self.staging_fallbacks += prepare.staging_fallbacks;
         self.cache_hits += prepare.cache_hits;
         self.cache_registrations += prepare.cache_registrations;
-        self.cache_overlap_misses += prepare.cache_overlap_misses;
-        self.cache_failures += prepare.cache_failures;
+        self.cache_split_copies += prepare.cache_split_copies;
+        self.cache_failed_gaps += prepare.cache_failed_gaps;
     }
 
     fn record_output(&mut self, batch: &RecordBatch) {
@@ -1029,11 +1041,11 @@ impl ArtifactBuildStats {
             // register_s above includes cache lookups and the new
             // registrations; registered_gib counts newly registered bytes.
             eprintln!(
-                "cuVS artifact registration cache: hits={} new_registrations={} overlap_misses={} failures={} ranges={} pinned_gib={:.3} unregister_s={:.3}",
+                "cuVS artifact registration cache: hits={} new_registrations={} split_copies={} failed_gaps={} ranges={} pinned_gib={:.3} unregister_s={:.3}",
                 self.cache_hits,
                 self.cache_registrations,
-                self.cache_overlap_misses,
-                self.cache_failures,
+                self.cache_split_copies,
+                self.cache_failed_gaps,
                 self.cache_ranges,
                 self.cache_pinned_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
                 secs(self.cache_unregister),
@@ -1511,6 +1523,7 @@ fn prepare_transform_batch(
     stats.matrix += matrix_start.elapsed();
     drop(matrix_span);
 
+    let mut copy_segments = None;
     let (prepared_matrix, input_registration, input_staging) = match matrix {
         MatrixBuffer::Borrowed { values, rows, cols } => match staging {
             Some(pool) if values.len() <= pool.slot_len() => {
@@ -1557,16 +1570,16 @@ fn prepare_transform_batch(
                 let cache = registration_cache.expect("checked by the match guard");
                 let register_span = NvtxSpan::new("cuvs/prepare_register_cached");
                 let register_start = Instant::now();
-                match cache.lookup_or_register(values)? {
-                    CacheLookup::Hit => stats.cache_hits += 1,
-                    CacheLookup::Registered { bytes } => {
-                        stats.cache_registrations += 1;
-                        stats.registered_bytes += bytes;
-                    }
-                    // The batch is copied from pageable memory; correct, just
-                    // not asynchronous.
-                    CacheLookup::Overlap => stats.cache_overlap_misses += 1,
-                    CacheLookup::Failed => stats.cache_failures += 1,
+                let cover = cache.cover(values)?;
+                if cover.new_registrations == 0 && cover.failed_gaps == 0 {
+                    stats.cache_hits += 1;
+                }
+                stats.cache_registrations += cover.new_registrations;
+                stats.registered_bytes += cover.new_bytes;
+                stats.cache_failed_gaps += cover.failed_gaps;
+                if cover.segments.len() > 1 {
+                    stats.cache_split_copies += 1;
+                    copy_segments = Some(cover.segments);
                 }
                 stats.register += register_start.elapsed();
                 drop(register_span);
@@ -1619,6 +1632,7 @@ fn prepare_transform_batch(
         matrix: prepared_matrix,
         input_registration,
         input_staging,
+        copy_segments,
     }))
 }
 
@@ -1680,8 +1694,8 @@ async fn prepare_transform_batches(
         stats.staging_fallbacks += batch_stats.staging_fallbacks;
         stats.cache_hits += batch_stats.cache_hits;
         stats.cache_registrations += batch_stats.cache_registrations;
-        stats.cache_overlap_misses += batch_stats.cache_overlap_misses;
-        stats.cache_failures += batch_stats.cache_failures;
+        stats.cache_split_copies += batch_stats.cache_split_copies;
+        stats.cache_failed_gaps += batch_stats.cache_failed_gaps;
 
         let Some(prepared) = prepared else {
             continue;
