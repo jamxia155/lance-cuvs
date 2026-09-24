@@ -29,7 +29,11 @@
 //!
 //! Temporary debugging aid for the pinned-buffer-pool investigation --
 //! not meant to ship enabled, and not meant to stay in the tree long-term.
+//!
+//! Also feeds `large_alloc_gauge` (always on; only allocations of 256 MiB
+//! and up touch it).
 
+use crate::large_alloc_gauge;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::ffi::CStr;
@@ -107,22 +111,34 @@ pub struct AllocTracer;
 unsafe impl GlobalAlloc for AllocTracer {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            large_alloc_gauge::on_alloc(layout.size());
+        }
         maybe_log("alloc", layout.size(), layout.align());
         ptr
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            large_alloc_gauge::on_alloc(layout.size());
+        }
         maybe_log("alloc_zeroed", layout.size(), layout.align());
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
+        large_alloc_gauge::on_dealloc(layout.size());
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let out = unsafe { System.realloc(ptr, layout, new_size) };
+        // On failure the original allocation is untouched.
+        if !out.is_null() {
+            large_alloc_gauge::on_dealloc(layout.size());
+            large_alloc_gauge::on_alloc(new_size);
+        }
         maybe_log("realloc", new_size, layout.align());
         out
     }

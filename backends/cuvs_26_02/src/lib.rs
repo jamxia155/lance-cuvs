@@ -14,6 +14,7 @@
 mod alloc_trace;
 mod backend;
 mod cuda;
+mod large_alloc_gauge;
 #[cfg(feature = "python")]
 mod python;
 

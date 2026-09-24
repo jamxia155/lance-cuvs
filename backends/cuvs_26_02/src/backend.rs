@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::large_alloc_gauge;
 use crate::cuda::{
     CudaEvent, CudaStream, CuvsIvfPqIndex, DeviceTensor, HostTensorView,
     MatrixBuffer, PinnedHostBuffer, PinnedStagingPool, PinnedStagingSlot, RegisteredHostBuffer,
@@ -1208,6 +1209,30 @@ fn staging_slot_rows(dataset: &Dataset, batch_size: usize) -> usize {
         .map_or(batch_size, |rows| rows.min(batch_size))
 }
 
+/// `LANCE_CUVS_SCAN_IO_BUFFER_GIB`: the scanner's I/O buffer budget -- how
+/// many bytes of reads may be in flight or read but not yet decoded. The
+/// 16 GiB default was sized for a disk-bound scan; once the stage is
+/// GPU-bound it mostly sets how far reads run ahead of the GPU. Accepts
+/// fractions. Clamped to at least 1 GiB: Lance's scanner deadlocks if a
+/// single batch (610 MiB on the benchmark dataset) exceeds the budget.
+fn scan_io_buffer_size_from_env() -> u64 {
+    const MIN_BYTES: u64 = 1024 * 1024 * 1024;
+    let Some(gib) = std::env::var("LANCE_CUVS_SCAN_IO_BUFFER_GIB")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|gib| gib.is_finite() && *gib > 0.0)
+    else {
+        return DEFAULT_SCAN_IO_BUFFER_SIZE;
+    };
+    let bytes = (gib * (1u64 << 30) as f64) as u64;
+    if bytes < MIN_BYTES {
+        eprintln!(
+            "cuVS artifact scan: LANCE_CUVS_SCAN_IO_BUFFER_GIB={gib} raised to the 1 GiB minimum"
+        );
+    }
+    bytes.max(MIN_BYTES)
+}
+
 fn scan_batch_readahead_from_env() -> usize {
     std::env::var("LANCE_CUVS_SCAN_BATCH_READAHEAD")
         .ok()
@@ -1394,9 +1419,15 @@ async fn scan_transform_batches(
     scanner.with_row_id();
     scanner.batch_size(batch_size);
     scanner.scan_in_order(false);
-    scanner.fragment_readahead(scan_fragment_readahead_from_env());
+    let fragment_readahead = scan_fragment_readahead_from_env();
+    let io_buffer_size = scan_io_buffer_size_from_env();
+    eprintln!(
+        "cuVS artifact scan: fragment_readahead={fragment_readahead} io_buffer_gib={:.3}",
+        io_buffer_size as f64 / (1u64 << 30) as f64
+    );
+    scanner.fragment_readahead(fragment_readahead);
     scanner.batch_readahead(scan_batch_readahead_from_env());
-    scanner.io_buffer_size(DEFAULT_SCAN_IO_BUFFER_SIZE);
+    scanner.io_buffer_size(io_buffer_size);
     let mut stream = scanner.try_into_stream().await?;
     let mut stats = ArtifactScannerStats::default();
 
@@ -2422,6 +2453,7 @@ pub async fn assign_ivf_pq_to_artifact(
         return Err(error);
     }
     let append_start = Instant::now();
+    large_alloc_gauge::begin_window();
     let append_result = append_transformed_batches_to_artifact(
         dataset,
         column,
@@ -2440,6 +2472,7 @@ pub async fn assign_ivf_pq_to_artifact(
     // silently fold that nsys-internal export time into a number that's
     // supposed to be pure pipeline wall clock.
     let append_elapsed = append_start.elapsed();
+    let gauge = large_alloc_gauge::end_window();
     drop(append_tx);
     let stop_start = Instant::now();
     if let Err(stop_error) = cuda_profiler_stop() {
@@ -2460,6 +2493,22 @@ pub async fn assign_ivf_pq_to_artifact(
         "cuVS artifact append_transformed_batches time: {:.3}s",
         append_elapsed.as_secs_f64()
     );
+    if let Some(gauge) = gauge {
+        eprintln!(
+            "cuVS artifact large allocations (>= {} MiB) live: peak={} ({:.2} GiB, at {:.2}s) mean={:.1} p50={} p90={} p99={} at_start={} at_end={} window_s={:.3}",
+            large_alloc_gauge::MIN_BYTES >> 20,
+            gauge.peak,
+            gauge.peak_bytes as f64 / (1u64 << 30) as f64,
+            gauge.time_to_peak.as_secs_f64(),
+            gauge.mean,
+            gauge.p50,
+            gauge.p90,
+            gauge.p99,
+            gauge.live_at_start,
+            gauge.live_at_end,
+            gauge.window.as_secs_f64(),
+        );
+    }
     let files = append_task
         .await
         .map_err(|error| Error::io(format!("partition artifact append task failed: {error}")))??;
