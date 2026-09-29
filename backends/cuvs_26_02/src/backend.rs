@@ -871,6 +871,30 @@ fn can_block_in_place() -> bool {
     }
 }
 
+/// `LANCE_CUVS_SCAN_IO_BUFFER_GIB`: the scanner's I/O buffer budget -- how
+/// many bytes of reads may be in flight or read but not yet decoded. The
+/// 16 GiB default was sized for a disk-bound scan; once the stage is
+/// GPU-bound it mostly sets how far reads run ahead of the GPU. Accepts
+/// fractions. Clamped to at least 1 GiB: Lance's scanner deadlocks if a
+/// single batch (610 MiB on the benchmark dataset) exceeds the budget.
+fn scan_io_buffer_size_from_env() -> u64 {
+    const MIN_BYTES: u64 = 1024 * 1024 * 1024;
+    let Some(gib) = std::env::var("LANCE_CUVS_SCAN_IO_BUFFER_GIB")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|gib| gib.is_finite() && *gib > 0.0)
+    else {
+        return DEFAULT_SCAN_IO_BUFFER_SIZE;
+    };
+    let bytes = (gib * (1u64 << 30) as f64) as u64;
+    if bytes < MIN_BYTES {
+        eprintln!(
+            "cuVS artifact scan: LANCE_CUVS_SCAN_IO_BUFFER_GIB={gib} raised to the 1 GiB minimum"
+        );
+    }
+    bytes.max(MIN_BYTES)
+}
+
 fn scan_batch_readahead_from_env() -> usize {
     std::env::var("LANCE_CUVS_SCAN_BATCH_READAHEAD")
         .ok()
@@ -1025,9 +1049,15 @@ async fn scan_transform_batches(
     scanner.with_row_id();
     scanner.batch_size(batch_size);
     scanner.scan_in_order(false);
-    scanner.fragment_readahead(scan_fragment_readahead_from_env());
+    let fragment_readahead = scan_fragment_readahead_from_env();
+    let io_buffer_size = scan_io_buffer_size_from_env();
+    eprintln!(
+        "cuVS artifact scan: fragment_readahead={fragment_readahead} io_buffer_gib={:.3}",
+        io_buffer_size as f64 / (1u64 << 30) as f64
+    );
+    scanner.fragment_readahead(fragment_readahead);
     scanner.batch_readahead(scan_batch_readahead_from_env());
-    scanner.io_buffer_size(DEFAULT_SCAN_IO_BUFFER_SIZE);
+    scanner.io_buffer_size(io_buffer_size);
     let mut stream = scanner.try_into_stream().await?;
     let mut stats = ArtifactScannerStats::default();
 
