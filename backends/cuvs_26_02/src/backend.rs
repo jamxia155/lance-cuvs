@@ -7,10 +7,12 @@ use crate::cuda::{
     create_index_params, destroy_index_params, enable_rmm_pool_from_env, ivf_centroids_from_host,
     make_tensor_view, matrix_from_vectors, pq_codebook_from_host,
 };
-use arrow::compute::{concat_batches, filter};
+use arrow::compute::filter;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float32Type;
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, UInt32Array};
+use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array,
+};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use cuvs::Resources;
 use futures::lock::Mutex;
@@ -758,21 +760,64 @@ async fn sample_training_vectors(
         ));
     }
 
+    let dimension = infer_dimension(dataset, column)?;
     let ranges = training_sample_ranges(num_rows, sample_rows);
+    let expected_rows: usize = ranges.iter().map(|r| (r.end - r.start) as usize).sum();
     let projection = Arc::new(dataset.schema().project(&[column])?);
-    let stream = dataset.take_scan(
+    let mut stream = dataset.take_scan(
         Box::pin(stream::iter(ranges.into_iter().map(Ok))),
         projection,
         TRAINING_SAMPLE_BATCH_READAHEAD,
     );
-    let batches = stream.try_collect::<Vec<_>>().await?;
-    let Some(schema) = batches.first().map(RecordBatch::schema) else {
+
+    // Copy each batch directly into one pre-allocated buffer as it arrives,
+    // instead of collecting all batches and running `concat_batches` over
+    // them afterward. `concat_batches` ran single-threaded at ~39% of this
+    // machine's measured single-threaded memcpy bandwidth (1.78 GB/s vs.
+    // 4.52 GB/s); a plain `copy_from_slice` per batch runs close to memcpy
+    // speed.
+    let mut sample_values = vec![0f32; expected_rows * dimension];
+    let mut offset_rows = 0usize;
+    while let Some(batch) = stream.try_next().await? {
+        let vectors = vector_column_to_fsl(&batch, column)?;
+        let rows = vectors.len();
+        if rows == 0 {
+            continue;
+        }
+        let matrix = matrix_from_vectors(&vectors)?;
+        let src: &[f32] = match &matrix {
+            MatrixBuffer::Borrowed { values, .. } => values,
+            MatrixBuffer::Owned(array) => array
+                .as_slice_memory_order()
+                .ok_or_else(|| Error::io("training sample matrix is not contiguous"))?,
+        };
+        if src.len() != rows * dimension {
+            return Err(Error::io(format!(
+                "training sample batch vector width mismatch: expected {} values ({rows} rows x {dimension} dim), got {}",
+                rows * dimension,
+                src.len()
+            )));
+        }
+        let dst_start = offset_rows * dimension;
+        let dst_end = dst_start + src.len();
+        if dst_end > sample_values.len() {
+            sample_values.resize(dst_end, 0.0);
+        }
+        sample_values[dst_start..dst_end].copy_from_slice(src);
+        offset_rows += rows;
+    }
+
+    if offset_rows == 0 {
         return Err(Error::invalid_input(
             "cuVS training sample did not return any vectors",
         ));
-    };
-    let batch = concat_batches(&schema, &batches)?;
-    Ok(vector_column_to_fsl(&batch, column)?)
+    }
+    sample_values.truncate(offset_rows * dimension);
+
+    Ok(FixedSizeListArray::try_new_from_values(
+        Float32Array::from(sample_values),
+        dimension as i32,
+    )?)
 }
 
 async fn scan_transform_batches(
