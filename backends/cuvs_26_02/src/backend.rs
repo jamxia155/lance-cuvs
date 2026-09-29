@@ -187,7 +187,6 @@ impl VectorBuildBackend for CuvsVectorBuildBackend {
         async move {
             match params.kind {
                 VectorIndexKind::IvfPq(build_params) => {
-                    let train_start = Instant::now();
                     let trained = train_ivf_pq(
                         dataset,
                         &params.column,
@@ -200,11 +199,6 @@ impl VectorBuildBackend for CuvsVectorBuildBackend {
                         params.filter_nan,
                     )
                     .await?;
-                    eprintln!(
-                        "cuVS train_ivf_pq time: {:.3}s",
-                        train_start.elapsed().as_secs_f64()
-                    );
-                    let artifact_start = Instant::now();
                     let files = assign_ivf_pq_to_artifact(
                         dataset,
                         &params.column,
@@ -215,11 +209,6 @@ impl VectorBuildBackend for CuvsVectorBuildBackend {
                         None,
                     )
                     .await?;
-                    eprintln!(
-                        "cuVS assign_ivf_pq_to_artifact time: {:.3}s files={}",
-                        artifact_start.elapsed().as_secs_f64(),
-                        files.len()
-                    );
                     Ok(VectorIndexBuildOutput::PartitionArtifact(
                         PartitionArtifactBuildOutput {
                             artifact_uri: params.artifact_uri,
@@ -1184,6 +1173,7 @@ pub async fn train_ivf_pq(
     num_bits: usize,
     filter_nan: bool,
 ) -> Result<TrainedIvfPqIndex> {
+    let train_start = Instant::now();
     if num_bits != 8 {
         return Err(Error::not_supported(
             "cuVS IVF_PQ currently supports only num_bits=8",
@@ -1237,6 +1227,8 @@ pub async fn train_ivf_pq(
         matrix_view.as_ptr() as *mut std::ffi::c_void,
     );
 
+    // k-means (IVF centroids) and PQ codebook training in one call.
+    let build_start = Instant::now();
     let build_result = check_cuvs(
         unsafe {
             cuvs_sys::cuvsIvfPqBuild(resources.0, params, dataset_tensor.as_mut_ptr(), index.raw)
@@ -1245,6 +1237,7 @@ pub async fn train_ivf_pq(
     );
     destroy_index_params(params);
     build_result?;
+    let build_time = build_start.elapsed();
 
     let mut centers = make_tensor_view();
     check_cuvs(
@@ -1268,6 +1261,14 @@ pub async fn train_ivf_pq(
         dimension,
         num_bits,
     )?;
+    // Whole training phase (Lance's train_ivf + train_quantizer): sampling,
+    // NaN filtering, cuvsIvfPqBuild, and reading the centroids and codebook
+    // back.
+    eprintln!(
+        "phase train_ivf+train_quantizer (lance-cuvs backend: train_ivf_pq): {:.3}s, of which cuvsIvfPqBuild {:.3}s",
+        train_start.elapsed().as_secs_f64(),
+        build_time.as_secs_f64()
+    );
 
     Ok(TrainedIvfPqIndex {
         resources,
@@ -1332,6 +1333,7 @@ pub async fn assign_ivf_pq_to_artifact(
     filter_nan: bool,
     storage_options: Option<&HashMap<String, String>>,
 ) -> Result<Vec<String>> {
+    let artifact_start = Instant::now();
     let artifact = PartitionArtifactBuilder::try_new(
         artifact_uri,
         trained.num_partitions,
@@ -1365,6 +1367,13 @@ pub async fn assign_ivf_pq_to_artifact(
     let files = append_task
         .await
         .map_err(|error| Error::io(format!("partition artifact append task failed: {error}")))??;
+    // Whole shuffle phase (partition artifact build): builder setup,
+    // scan/transform/append, and the artifact writers' final flush.
+    eprintln!(
+        "phase shuffle (lance-cuvs backend: assign_ivf_pq_to_artifact): {:.3}s files={}",
+        artifact_start.elapsed().as_secs_f64(),
+        files.len()
+    );
     Ok(files)
 }
 
