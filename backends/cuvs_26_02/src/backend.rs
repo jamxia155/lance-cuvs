@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::cuda::{
-    CudaEvent, CuvsIvfPqIndex, DeviceTensor, HostTensorView, MatrixBuffer, PinnedHostBuffer,
+    CudaEvent, CudaStream, CuvsIvfPqIndex, DeviceTensor, HostTensorView, MatrixBuffer, PinnedHostBuffer,
     RegisteredHostBuffer, check_cuvs, copy_tensor_to_host_f32_2d, copy_tensor_to_host_f32_3d,
     create_index_params, destroy_index_params, enable_rmm_pool_from_env, ivf_centroids_from_host,
     make_tensor_view, matrix_from_vectors, pq_codebook_from_host,
@@ -46,6 +46,9 @@ const TRAINING_SAMPLE_BATCH_READAHEAD: usize = 64;
 // (LANCE_CUVS_SAMPLE_PREFAULT_THREADS). Deliberately not scaled to all cores,
 // so it does not contend with the concurrent sample scan's own threads.
 const DEFAULT_SAMPLE_PREFAULT_THREADS: usize = 8;
+// Transform slots with LANCE_CUVS_TRANSFORM_OVERLAP=1: one transforming, one
+// whose H2D is already enqueued on the copy stream, one being drained.
+const TRANSFORM_OVERLAP_SLOTS: usize = 3;
 
 /// A trained cuVS IVF_PQ model that can be reused for artifact builds.
 ///
@@ -345,6 +348,11 @@ struct TransformSlot {
     codes_device: DeviceTensor<u8>,
     h2d_start: CudaEvent,
     h2d_done: CudaEvent,
+    // Recorded on the compute stream right before the transform. With H2D on
+    // a separate copy stream, `transform_done - h2d_done` would include time
+    // spent waiting for the previous transform; this keeps `transform_s` a
+    // measure of the transform alone.
+    transform_start: CudaEvent,
     transform_done: CudaEvent,
     output_ready: CudaEvent,
     input_vectors: Option<FixedSizeListArray>,
@@ -353,6 +361,16 @@ struct TransformSlot {
     row_ids: Option<Arc<dyn Array>>,
     rows: usize,
 }
+
+// SAFETY: a `TransformSlot` owns raw CUDA handles (device buffers, pinned host
+// buffers, events) plus the cuVS resources handle its buffers were allocated
+// from. CUDA runtime handles may be used from any host thread, and a slot is
+// only ever used by one thread at a time: with transform overlap enabled it
+// is moved by value between the GPU-driving thread and the drain thread
+// through channels. Compute-stream work (transform, D2H, `output_ready`) is
+// always enqueued from the GPU-driving thread; the drain thread only
+// synchronizes on events and touches host memory.
+unsafe impl Send for TransformSlot {}
 
 enum PreparedMatrix {
     F32Arrow {
@@ -450,6 +468,7 @@ impl TransformSlot {
             codes_device: DeviceTensor::try_new(resources, &[max_rows, code_width])?,
             h2d_start: CudaEvent::try_new()?,
             h2d_done: CudaEvent::try_new()?,
+            transform_start: CudaEvent::try_new()?,
             transform_done: CudaEvent::try_new()?,
             output_ready: CudaEvent::try_new()?,
             input_vectors: None,
@@ -470,6 +489,23 @@ impl TransformSlot {
         stream: cuvs_sys::cudaStream_t,
         prepared: PreparedTransformBatch,
     ) -> Result<LaunchTimings> {
+        let staged = self.stage_input(trained, stream, prepared)?;
+        let mut timings = self.run_transform(trained, stream)?;
+        timings.h2d_enqueue += staged.h2d_enqueue;
+        Ok(timings)
+    }
+
+    /// Phase 1 of a launch: takes ownership of the prepared batch's inputs
+    /// and enqueues its H2D copy on `copy_stream`, bracketed by `h2d_start` /
+    /// `h2d_done`. With transform overlap enabled, `copy_stream` is a
+    /// dedicated copy stream, so this copy runs while the previous batch's
+    /// transform is still executing on the compute stream.
+    fn stage_input(
+        &mut self,
+        trained: &TrainedIvfPqIndex,
+        copy_stream: cuvs_sys::cudaStream_t,
+        prepared: PreparedTransformBatch,
+    ) -> Result<LaunchTimings> {
         let mut timings = LaunchTimings::default();
         let code_width = trained.pq_code_width();
         let row_ids = prepared.row_ids;
@@ -485,12 +521,14 @@ impl TransformSlot {
         self.row_ids = Some(row_ids);
         self.input_registration = prepared.input_registration;
 
-        self.h2d_start.record(stream)?;
+        self.h2d_start.record(copy_stream)?;
         let h2d_enqueue_start = Instant::now();
         self.input_device
-            .copy_from_host_async(&trained.resources, input_slice)?;
+            .copy_from_host_async_on(copy_stream, input_slice)?;
         timings.h2d_enqueue += h2d_enqueue_start.elapsed();
-        self.h2d_done.record(stream)?;
+        self.h2d_done.record(copy_stream)?;
+        // Keep the host inputs (registration, decoded buffer) until the drain
+        // has synchronized: the copy just enqueued is still reading from them.
         match matrix {
             PreparedMatrix::F32Arrow { vectors, .. } => {
                 self.input_vectors = Some(vectors);
@@ -501,6 +539,26 @@ impl TransformSlot {
                 self.input_matrix = Some(array);
             }
         }
+        Ok(timings)
+    }
+
+    /// Phase 2 of a launch: runs the transform on the compute `stream` (after
+    /// making it wait for this slot's H2D) and enqueues the D2H of its
+    /// outputs, ending with `output_ready`. `cuvsIvfPqTransform` blocks the
+    /// calling thread until its GPU work has finished (cuVS synchronizes
+    /// after each internal batch), so this returns roughly when the GPU does.
+    /// Must be called from the GPU-driving thread.
+    fn run_transform(
+        &mut self,
+        trained: &TrainedIvfPqIndex,
+        stream: cuvs_sys::cudaStream_t,
+    ) -> Result<LaunchTimings> {
+        let mut timings = LaunchTimings::default();
+        let code_width = trained.pq_code_width();
+        let rows = self.rows;
+        // No-op ordering-wise when the H2D was enqueued on this same stream.
+        self.h2d_done.make_stream_wait(stream)?;
+        self.transform_start.record(stream)?;
         let transform_call_start = Instant::now();
         check_cuvs(
             unsafe {
@@ -537,7 +595,7 @@ impl TransformSlot {
         self.output_ready.synchronize()?;
         let sync = sync_start.elapsed();
         let h2d = self.h2d_done.elapsed_since(&self.h2d_start)?;
-        let transform = self.transform_done.elapsed_since(&self.h2d_done)?;
+        let transform = self.transform_done.elapsed_since(&self.transform_start)?;
         let d2h = self.output_ready.elapsed_since(&self.transform_done)?;
         self.input_registration = None;
         self.input_vectors = None;
@@ -634,6 +692,20 @@ impl ArtifactBuildStats {
         self.drain_build_batch += drained.build_batch;
     }
 
+    /// Folds in the drain thread's statistics (transform overlap mode), where
+    /// draining and forwarding happen off the GPU-driving thread.
+    fn merge_drain(&mut self, other: ArtifactBuildStats) {
+        self.output_batches += other.output_batches;
+        self.output_rows += other.output_rows;
+        self.drain += other.drain;
+        self.send += other.send;
+        self.gpu_h2d += other.gpu_h2d;
+        self.gpu_transform += other.gpu_transform;
+        self.gpu_d2h += other.gpu_d2h;
+        self.drain_sync += other.drain_sync;
+        self.drain_build_batch += other.drain_build_batch;
+    }
+
     fn record_launch_timings(&mut self, timings: LaunchTimings) {
         self.launch_h2d_enqueue += timings.h2d_enqueue;
         self.launch_transform_call += timings.transform_call;
@@ -723,6 +795,27 @@ fn scan_fragment_readahead_from_env() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_SCAN_FRAGMENT_READAHEAD)
+}
+
+/// `LANCE_CUVS_TRANSFORM_OVERLAP=1` (or `true`): overlap each batch's H2D
+/// copy with the previous batch's transform (separate copy stream) and drain
+/// finished batches on a helper thread, so the GPU is not left idle between
+/// transforms. Off by default.
+fn transform_overlap_enabled_from_env() -> bool {
+    matches!(
+        std::env::var("LANCE_CUVS_TRANSFORM_OVERLAP").ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// The overlap loop blocks the calling thread for the whole stage (inside
+/// `tokio::task::block_in_place`), which is not allowed on a current-thread
+/// runtime.
+fn can_block_in_place() -> bool {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread,
+        Err(_) => true,
+    }
 }
 
 fn scan_batch_readahead_from_env() -> usize {
@@ -1079,7 +1172,21 @@ async fn append_transformed_batches_to_artifact(
         .resources
         .get_cuda_stream()
         .map_err(|error| Error::io(error.to_string()))?;
-    let mut slots = (0..PIPELINE_SLOTS)
+    let overlap = transform_overlap_enabled_from_env();
+    let overlap = if overlap && !can_block_in_place() {
+        warn!(
+            "LANCE_CUVS_TRANSFORM_OVERLAP ignored: it needs a multi-threaded tokio runtime; using the default transform loop"
+        );
+        false
+    } else {
+        overlap
+    };
+    let transform_slots = if overlap {
+        TRANSFORM_OVERLAP_SLOTS
+    } else {
+        PIPELINE_SLOTS
+    };
+    let mut slots = (0..transform_slots)
         .map(|_| {
             TransformSlot::try_new(
                 &trained.resources,
@@ -1120,6 +1227,37 @@ async fn append_transformed_batches_to_artifact(
         .collect::<Vec<_>>();
     drop(prepared_tx);
 
+    if overlap {
+        let copy_stream = CudaStream::try_new_non_blocking()?;
+        let overlap_slots = std::mem::take(&mut slots);
+        let drain_append_tx = append_tx.clone();
+        // Blocks this thread for the whole loop; `block_in_place` keeps that
+        // legal if it is ever polled on a runtime worker (normally it runs on
+        // the Python caller's `block_on` thread, where it is a no-op).
+        let overlap_stats = tokio::task::block_in_place(|| {
+            run_overlapped_transforms(
+                trained,
+                cuda_stream,
+                copy_stream.raw(),
+                code_width,
+                &mut prepared_rx,
+                overlap_slots,
+                drain_append_tx,
+                &mut stats,
+            )
+        })?;
+        eprintln!(
+            "cuVS artifact transform overlap: slots={} batches={} lookahead_hits={} free_slot_wait_s={:.3} \
+             (drain_s/send_s below are on the drain thread, off the GPU-driving thread)",
+            TRANSFORM_OVERLAP_SLOTS,
+            overlap_stats.batches,
+            overlap_stats.lookahead_hits,
+            secs(overlap_stats.free_slot_wait),
+        );
+    }
+
+    // With overlap on, `prepared_rx` is already exhausted and `slots` is
+    // empty, so this loop and the final drain below are no-ops.
     while let Some(prepared) = prepared_rx.next().await {
         let slot = &mut slots[next_slot];
         let drain_start = Instant::now();
@@ -1179,6 +1317,178 @@ async fn append_transformed_batches_to_artifact(
     }
     stats.log();
     Ok(())
+}
+
+#[derive(Default)]
+struct OverlapStats {
+    batches: usize,
+    // Batches whose H2D was enqueued before the previous transform started,
+    // i.e. actually overlapped. Misses happen when the next batch was not yet
+    // prepared, or no transform slot was free.
+    lookahead_hits: usize,
+    // GPU-driving thread blocked waiting for a free transform slot.
+    free_slot_wait: Duration,
+}
+
+/// Transform loop with H2D/compute overlap (`LANCE_CUVS_TRANSFORM_OVERLAP=1`).
+///
+/// `cuvsIvfPqTransform` blocks until its GPU work finishes (cuVS
+/// synchronizes after each internal batch -- treated as a fixed API
+/// constraint), so a single thread cannot queue work ahead. In the default
+/// loop the GPU therefore sits idle while that thread drains the previous
+/// batch (event sync, `cudaHostUnregister`, frees, building the output batch:
+/// 13-26 ms per batch measured) and then enqueues the next H2D. Here:
+/// - the current thread only drives the GPU: before each transform it
+///   enqueues the *next* batch's H2D on a separate copy stream, if that batch
+///   is already prepared and a slot is free, so the copy overlaps the
+///   transform; the transform's compute stream waits on its own H2D event;
+/// - a helper thread drains finished slots and forwards their output
+///   batches, then returns the slots.
+///
+/// Compute-stream work stays on the calling thread throughout, which matters
+/// if the compute stream is a per-thread default stream.
+#[allow(clippy::too_many_arguments)]
+fn run_overlapped_transforms(
+    trained: &TrainedIvfPqIndex,
+    compute_stream: cuvs_sys::cudaStream_t,
+    copy_stream: cuvs_sys::cudaStream_t,
+    code_width: usize,
+    prepared_rx: &mut mpsc::Receiver<PreparedTransformBatch>,
+    slots: Vec<TransformSlot>,
+    append_tx: mpsc::Sender<Result<RecordBatch>>,
+    stats: &mut ArtifactBuildStats,
+) -> Result<OverlapStats> {
+    let (drain_tx, drain_rx) = std::sync::mpsc::channel::<TransformSlot>();
+    let (free_tx, free_rx) = std::sync::mpsc::channel::<TransformSlot>();
+    for slot in slots {
+        free_tx
+            .send(slot)
+            .map_err(|_| Error::io("failed to seed transform slot pool"))?;
+    }
+    std::thread::scope(|scope| {
+        let drainer = std::thread::Builder::new()
+            .name("cuvs-transform-drain".to_string())
+            .spawn_scoped(scope, move || {
+                drain_transformed_slots(drain_rx, free_tx, append_tx, code_width)
+            })
+            .map_err(|error| Error::io(format!("failed to start transform drain thread: {error}")))?;
+        // `drain_tx` moves in and is dropped when this returns, which ends the
+        // drain thread's loop.
+        let driven = drive_overlapped_transforms(
+            trained,
+            compute_stream,
+            copy_stream,
+            prepared_rx,
+            &free_rx,
+            drain_tx,
+            stats,
+        );
+        let drained = drainer
+            .join()
+            .map_err(|_| Error::io("transform drain thread panicked"))?;
+        match (driven, drained) {
+            (Ok(overlap), Ok(drain_stats)) => {
+                stats.merge_drain(drain_stats);
+                Ok(overlap)
+            }
+            // A drain failure is the root cause when the driver only saw the
+            // drain thread disappear.
+            (_, Err(error)) => Err(error),
+            (Err(error), Ok(_)) => Err(error),
+        }
+    })
+}
+
+fn drive_overlapped_transforms(
+    trained: &TrainedIvfPqIndex,
+    compute_stream: cuvs_sys::cudaStream_t,
+    copy_stream: cuvs_sys::cudaStream_t,
+    prepared_rx: &mut mpsc::Receiver<PreparedTransformBatch>,
+    free_rx: &std::sync::mpsc::Receiver<TransformSlot>,
+    drain_tx: std::sync::mpsc::Sender<TransformSlot>,
+    stats: &mut ArtifactBuildStats,
+) -> Result<OverlapStats> {
+    let drain_stopped = || Error::io("transform drain thread stopped");
+    let mut overlap = OverlapStats::default();
+    // A slot taken for a look-ahead that turned out to have no batch ready.
+    let mut spare: Option<TransformSlot> = None;
+    // The next batch, with its H2D already enqueued.
+    let mut ahead: Option<(TransformSlot, LaunchTimings)> = None;
+
+    loop {
+        let (mut slot, staged) = match ahead.take() {
+            Some(staged_slot) => staged_slot,
+            None => {
+                let Some(prepared) = futures::executor::block_on(prepared_rx.next()) else {
+                    break;
+                };
+                let mut slot = match spare.take() {
+                    Some(slot) => slot,
+                    None => {
+                        let wait_start = Instant::now();
+                        let slot = free_rx.recv().map_err(|_| drain_stopped())?;
+                        overlap.free_slot_wait += wait_start.elapsed();
+                        slot
+                    }
+                };
+                let stage_start = Instant::now();
+                let staged = slot.stage_input(trained, copy_stream, prepared)?;
+                stats.launch += stage_start.elapsed();
+                (slot, staged)
+            }
+        };
+
+        // Look ahead without waiting for anything: waiting here would delay
+        // the transform below.
+        if let Some(mut next_slot) = spare.take().or_else(|| free_rx.try_recv().ok()) {
+            match prepared_rx.next().now_or_never() {
+                Some(Some(prepared)) => {
+                    let stage_start = Instant::now();
+                    let next_staged = next_slot.stage_input(trained, copy_stream, prepared)?;
+                    stats.launch += stage_start.elapsed();
+                    ahead = Some((next_slot, next_staged));
+                    overlap.lookahead_hits += 1;
+                }
+                // Nothing prepared yet, or the channel is closed.
+                _ => spare = Some(next_slot),
+            }
+        }
+
+        let transform_start = Instant::now();
+        let mut timings = slot.run_transform(trained, compute_stream)?;
+        stats.launch += transform_start.elapsed();
+        timings.h2d_enqueue += staged.h2d_enqueue;
+        stats.record_launch_timings(timings);
+        overlap.batches += 1;
+        drain_tx.send(slot).map_err(|_| drain_stopped())?;
+    }
+    Ok(overlap)
+}
+
+/// Drain thread for the overlap loop: waits for each slot's outputs, releases
+/// its inputs, builds and forwards the output batch, then returns the slot.
+fn drain_transformed_slots(
+    drain_rx: std::sync::mpsc::Receiver<TransformSlot>,
+    free_tx: std::sync::mpsc::Sender<TransformSlot>,
+    mut append_tx: mpsc::Sender<Result<RecordBatch>>,
+    code_width: usize,
+) -> Result<ArtifactBuildStats> {
+    let mut stats = ArtifactBuildStats::default();
+    for mut slot in drain_rx {
+        let drain_start = Instant::now();
+        let drained = slot
+            .drain_to_batch(code_width)?
+            .ok_or_else(|| Error::io("transform slot reached the drain without pending output"))?;
+        stats.drain += drain_start.elapsed();
+        stats.record_drained(&drained);
+        let send_start = Instant::now();
+        futures::executor::block_on(append_tx.send(Ok(drained.batch)))
+            .map_err(|error| Error::io(format!("failed to forward transformed batch: {error}")))?;
+        stats.send += send_start.elapsed();
+        // Fails only once the driver has finished; the slot is then dropped.
+        let _ = free_tx.send(slot);
+    }
+    Ok(stats)
 }
 
 async fn append_artifact_batches(
