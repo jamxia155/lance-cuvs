@@ -42,6 +42,10 @@ const DEFAULT_SCAN_BATCH_READAHEAD: usize = 32;
 const DEFAULT_PREPARE_WORKERS: usize = 1;
 const TRAINING_SAMPLE_CHUNK_ROWS: usize = 8 * 1024;
 const TRAINING_SAMPLE_BATCH_READAHEAD: usize = 64;
+// Threads for prefaulting the training-sample buffer
+// (LANCE_CUVS_SAMPLE_PREFAULT_THREADS). Deliberately not scaled to all cores,
+// so it does not contend with the concurrent sample scan's own threads.
+const DEFAULT_SAMPLE_PREFAULT_THREADS: usize = 8;
 
 /// A trained cuVS IVF_PQ model that can be reused for artifact builds.
 ///
@@ -706,6 +710,14 @@ fn prepare_workers_from_env() -> usize {
         .unwrap_or(DEFAULT_PREPARE_WORKERS)
 }
 
+fn sample_prefault_threads_from_env() -> usize {
+    std::env::var("LANCE_CUVS_SAMPLE_PREFAULT_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or(DEFAULT_SAMPLE_PREFAULT_THREADS)
+}
+
 fn scan_fragment_readahead_from_env() -> usize {
     std::env::var("LANCE_CUVS_SCAN_FRAGMENT_READAHEAD")
         .ok()
@@ -770,13 +782,33 @@ async fn sample_training_vectors(
         TRAINING_SAMPLE_BATCH_READAHEAD,
     );
 
-    // Copy each batch directly into one pre-allocated buffer as it arrives,
-    // instead of collecting all batches and running `concat_batches` over
-    // them afterward. `concat_batches` ran single-threaded at ~39% of this
-    // machine's measured single-threaded memcpy bandwidth (1.78 GB/s vs.
-    // 4.52 GB/s); a plain `copy_from_slice` per batch runs close to memcpy
-    // speed.
-    let mut sample_values = vec![0f32; expected_rows * dimension];
+    // Copy the batches into one pre-allocated buffer rather than collecting
+    // them and running `concat_batches`, which ran single-threaded at ~39% of
+    // this machine's measured single-threaded memcpy bandwidth.
+    //
+    // The first write to each page of a fresh allocation takes a page fault,
+    // which made the copy as slow as `concat_batches` (~4.4 s). So prefault
+    // the buffer on a few threads in a background task while the scan runs,
+    // collect the decoded batches in `pending` in the meantime (cheap: their
+    // values are Arc handles into Arrow's decode buffers), and copy once both
+    // have finished.
+    let prefault_handle = tokio::task::spawn_blocking(move || {
+        let mut buf = vec![0f32; expected_rows * dimension];
+        if !buf.is_empty() {
+            let num_threads = sample_prefault_threads_from_env().min(buf.len()).max(1);
+            let chunk_len = buf.len().div_ceil(num_threads);
+            std::thread::scope(|scope| {
+                for chunk in buf.chunks_mut(chunk_len) {
+                    scope.spawn(move || {
+                        chunk.iter_mut().for_each(|v| *v = 0.0);
+                    });
+                }
+            });
+        }
+        buf
+    });
+
+    let mut pending: Vec<(usize, FixedSizeListArray)> = Vec::new();
     let mut offset_rows = 0usize;
     while let Some(batch) = stream.try_next().await? {
         let vectors = vector_column_to_fsl(&batch, column)?;
@@ -784,6 +816,21 @@ async fn sample_training_vectors(
         if rows == 0 {
             continue;
         }
+        pending.push((offset_rows, vectors));
+        offset_rows += rows;
+    }
+
+    if offset_rows == 0 {
+        return Err(Error::invalid_input(
+            "cuVS training sample did not return any vectors",
+        ));
+    }
+
+    let mut sample_values = prefault_handle
+        .await
+        .map_err(|error| Error::io(format!("sample prefault task failed: {error}")))?;
+    for (dst_offset_rows, vectors) in pending {
+        let rows = vectors.len();
         let matrix = matrix_from_vectors(&vectors)?;
         let src: &[f32] = match &matrix {
             MatrixBuffer::Borrowed { values, .. } => values,
@@ -798,19 +845,12 @@ async fn sample_training_vectors(
                 src.len()
             )));
         }
-        let dst_start = offset_rows * dimension;
+        let dst_start = dst_offset_rows * dimension;
         let dst_end = dst_start + src.len();
         if dst_end > sample_values.len() {
             sample_values.resize(dst_end, 0.0);
         }
         sample_values[dst_start..dst_end].copy_from_slice(src);
-        offset_rows += rows;
-    }
-
-    if offset_rows == 0 {
-        return Err(Error::invalid_input(
-            "cuVS training sample did not return any vectors",
-        ));
     }
     sample_values.truncate(offset_rows * dimension);
 
