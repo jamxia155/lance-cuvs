@@ -3,9 +3,9 @@
 
 use crate::cuda::{
     CudaEvent, CudaStream, CuvsIvfPqIndex, DeviceTensor, HostTensorView, MatrixBuffer, PinnedHostBuffer,
-    RegisteredHostBuffer, check_cuvs, copy_tensor_to_host_f32_2d, copy_tensor_to_host_f32_3d,
+    RegisteredHostBuffer, RegistrationCache, check_cuvs, copy_tensor_to_host_f32_2d, copy_tensor_to_host_f32_3d,
     create_index_params, destroy_index_params, enable_rmm_pool_from_env, ivf_centroids_from_host,
-    make_tensor_view, matrix_from_vectors, pq_codebook_from_host,
+    jemalloc_never_releases_memory, make_tensor_view, matrix_from_vectors, pq_codebook_from_host,
 };
 use arrow::compute::filter;
 use arrow_array::cast::AsArray;
@@ -413,6 +413,10 @@ struct PreparedTransformBatch {
     row_ids: Arc<dyn Array>,
     matrix: PreparedMatrix,
     input_registration: Option<RegisteredHostBuffer>,
+    // Set by the registration cache when the input spans more than one
+    // registration: byte ranges to copy separately (see
+    // `RegistrationCache::cover`). `None` means one copy.
+    copy_segments: Option<Vec<std::ops::Range<usize>>>,
 }
 
 struct DrainedTransformBatch {
@@ -451,6 +455,10 @@ struct ArtifactPrepareStats {
     matrix: Duration,
     register: Duration,
     registered_bytes: usize,
+    cache_hits: usize,
+    cache_registrations: usize,
+    cache_split_copies: usize,
+    cache_failed_gaps: usize,
 }
 
 impl TransformSlot {
@@ -523,8 +531,16 @@ impl TransformSlot {
 
         self.h2d_start.record(copy_stream)?;
         let h2d_enqueue_start = Instant::now();
-        self.input_device
-            .copy_from_host_async_on(copy_stream, input_slice)?;
+        match &prepared.copy_segments {
+            Some(segments) => self.input_device.copy_segments_from_host_async_on(
+                copy_stream,
+                input_slice,
+                segments,
+            )?,
+            None => self
+                .input_device
+                .copy_from_host_async_on(copy_stream, input_slice)?,
+        }
         timings.h2d_enqueue += h2d_enqueue_start.elapsed();
         self.h2d_done.record(copy_stream)?;
         // Keep the host inputs (registration, decoded buffer) until the drain
@@ -654,6 +670,14 @@ struct ArtifactBuildStats {
     drain_build_batch: Duration,
     register: Duration,
     registered_bytes: usize,
+    cache_enabled: bool,
+    cache_hits: usize,
+    cache_registrations: usize,
+    cache_split_copies: usize,
+    cache_failed_gaps: usize,
+    cache_ranges: usize,
+    cache_pinned_bytes: usize,
+    cache_unregister: Duration,
 }
 
 impl ArtifactBuildStats {
@@ -676,6 +700,10 @@ impl ArtifactBuildStats {
         self.matrix += prepare.matrix;
         self.register += prepare.register;
         self.registered_bytes += prepare.registered_bytes;
+        self.cache_hits += prepare.cache_hits;
+        self.cache_registrations += prepare.cache_registrations;
+        self.cache_split_copies += prepare.cache_split_copies;
+        self.cache_failed_gaps += prepare.cache_failed_gaps;
     }
 
     fn record_output(&mut self, batch: &RecordBatch) {
@@ -739,6 +767,20 @@ impl ArtifactBuildStats {
             secs(self.register),
             self.registered_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         );
+        if self.cache_enabled {
+            // register_s above includes cache lookups and the new
+            // registrations; registered_gib counts newly registered bytes.
+            eprintln!(
+                "cuVS artifact registration cache: hits={} new_registrations={} split_copies={} failed_gaps={} ranges={} pinned_gib={:.3} unregister_s={:.3}",
+                self.cache_hits,
+                self.cache_registrations,
+                self.cache_split_copies,
+                self.cache_failed_gaps,
+                self.cache_ranges,
+                self.cache_pinned_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                secs(self.cache_unregister),
+            );
+        }
         eprintln!(
             "cuVS artifact gpu events: h2d_s={:.3} transform_s={:.3} d2h_s={:.3}",
             secs(self.gpu_h2d),
@@ -804,6 +846,17 @@ fn scan_fragment_readahead_from_env() -> usize {
 fn transform_overlap_enabled_from_env() -> bool {
     matches!(
         std::env::var("LANCE_CUVS_TRANSFORM_OVERLAP").ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// `LANCE_CUVS_REGISTRATION_CACHE=1` (or `true`): keep host memory registered
+/// with CUDA across batches instead of registering/unregistering each
+/// batch's decoded buffer. Enabled only if the allocator is verified never to
+/// return memory to the OS (see `RegistrationCache`).
+fn registration_cache_enabled_from_env() -> bool {
+    matches!(
+        std::env::var("LANCE_CUVS_REGISTRATION_CACHE").ok().as_deref(),
         Some("1") | Some("true")
     )
 }
@@ -1003,6 +1056,7 @@ fn prepare_transform_batch(
     batch: RecordBatch,
     column: &str,
     filter_nan: bool,
+    registration_cache: Option<&Arc<RegistrationCache>>,
     stats: &mut ArtifactPrepareStats,
 ) -> Result<Option<PreparedTransformBatch>> {
     stats.input_batches += 1;
@@ -1071,7 +1125,34 @@ fn prepare_transform_batch(
     let matrix = matrix_from_vectors(&filtered_vectors)?;
     stats.matrix += matrix_start.elapsed();
 
+    let mut copy_segments = None;
     let (prepared_matrix, input_registration) = match matrix {
+        MatrixBuffer::Borrowed { values, rows, cols } if registration_cache.is_some() => {
+            let cache = registration_cache.expect("checked by the match guard");
+            let register_start = Instant::now();
+            let cover = cache.cover(values)?;
+            if cover.new_registrations == 0 && cover.failed_gaps == 0 {
+                stats.cache_hits += 1;
+            }
+            stats.cache_registrations += cover.new_registrations;
+            stats.registered_bytes += cover.new_bytes;
+            stats.cache_failed_gaps += cover.failed_gaps;
+            if cover.segments.len() > 1 {
+                stats.cache_split_copies += 1;
+                copy_segments = Some(cover.segments);
+            }
+            stats.register += register_start.elapsed();
+            // Nothing per-batch to release: the cache owns registrations
+            // until the end of the stage.
+            (
+                PreparedMatrix::F32Arrow {
+                    vectors: filtered_vectors,
+                    rows,
+                    dimension: cols,
+                },
+                None,
+            )
+        }
         MatrixBuffer::Borrowed { values, rows, cols } => {
             let register_start = Instant::now();
             let registration = match RegisteredHostBuffer::try_new(values) {
@@ -1104,6 +1185,7 @@ fn prepare_transform_batch(
         row_ids: filtered_row_ids,
         matrix: prepared_matrix,
         input_registration,
+        copy_segments,
     }))
 }
 
@@ -1112,6 +1194,7 @@ async fn prepare_transform_batches(
     filter_nan: bool,
     raw_rx: Arc<Mutex<mpsc::Receiver<RecordBatch>>>,
     mut prepared_tx: mpsc::Sender<PreparedTransformBatch>,
+    registration_cache: Option<Arc<RegistrationCache>>,
 ) -> Result<ArtifactPrepareStats> {
     let mut stats = ArtifactPrepareStats {
         workers: 1,
@@ -1130,9 +1213,16 @@ async fn prepare_transform_batches(
             break;
         };
         let column = column.clone();
+        let registration_cache = registration_cache.clone();
         let (prepared, batch_stats) = tokio::task::spawn_blocking(move || {
             let mut batch_stats = ArtifactPrepareStats::default();
-            let prepared = prepare_transform_batch(batch, &column, filter_nan, &mut batch_stats)?;
+            let prepared = prepare_transform_batch(
+                batch,
+                &column,
+                filter_nan,
+                registration_cache.as_ref(),
+                &mut batch_stats,
+            )?;
             Ok::<_, Error>((prepared, batch_stats))
         })
         .await
@@ -1144,6 +1234,10 @@ async fn prepare_transform_batches(
         stats.matrix += batch_stats.matrix;
         stats.register += batch_stats.register;
         stats.registered_bytes += batch_stats.registered_bytes;
+        stats.cache_hits += batch_stats.cache_hits;
+        stats.cache_registrations += batch_stats.cache_registrations;
+        stats.cache_split_copies += batch_stats.cache_split_copies;
+        stats.cache_failed_gaps += batch_stats.cache_failed_gaps;
 
         let Some(prepared) = prepared else {
             continue;
@@ -1205,6 +1299,25 @@ async fn append_transformed_batches_to_artifact(
             prepare_workers
         );
     }
+    let registration_cache = if !registration_cache_enabled_from_env() {
+        None
+    } else {
+        match jemalloc_never_releases_memory() {
+            Ok(()) => {
+                eprintln!(
+                    "cuVS artifact prepare: registration cache enabled (jemalloc retains freed memory)"
+                );
+                stats.cache_enabled = true;
+                Some(Arc::new(RegistrationCache::new()))
+            }
+            Err(reason) => {
+                eprintln!(
+                    "cuVS artifact prepare: LANCE_CUVS_REGISTRATION_CACHE ignored, registering per batch instead: {reason}"
+                );
+                None
+            }
+        }
+    };
     let (raw_tx, raw_rx) = mpsc::channel::<RecordBatch>(prepare_workers);
     let raw_rx = Arc::new(Mutex::new(raw_rx));
     let scanner_task = tokio::spawn(scan_transform_batches(
@@ -1222,6 +1335,7 @@ async fn append_transformed_batches_to_artifact(
                 filter_nan,
                 raw_rx.clone(),
                 prepared_tx.clone(),
+                registration_cache.clone(),
             ))
         })
         .collect::<Vec<_>>();
@@ -1314,6 +1428,15 @@ async fn append_transformed_batches_to_artifact(
         } else {
             stats.drain += drain_start.elapsed();
         }
+    }
+    // Every slot has been drained (all H2D copies complete) and every prepare
+    // task has finished, so nothing can still read from a cached range.
+    if let Some(cache) = &registration_cache {
+        let unregister_start = Instant::now();
+        let (ranges, bytes) = cache.unregister_all();
+        stats.cache_unregister = unregister_start.elapsed();
+        stats.cache_ranges = ranges;
+        stats.cache_pinned_bytes = bytes;
     }
     stats.log();
     Ok(())
