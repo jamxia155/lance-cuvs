@@ -10,9 +10,11 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use ndarray::{Array2, ArrayView2};
-use std::ffi::{CStr, c_void};
+use std::collections::BTreeMap;
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::marker::PhantomData;
 use std::ptr;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 pub(crate) type CudaEventHandle = *mut c_void;
 
@@ -281,6 +283,61 @@ impl<T: DlElement> DeviceTensor<T> {
         )
     }
 
+    /// Like [`Self::copy_from_host_async_on`], but issued as one copy per
+    /// segment. `segments` are byte ranges relative to `src`'s start that
+    /// must tile `[0, size_of_val(src))` in order. Used when `src` spans more
+    /// than one host registration (see [`RegistrationCache::cover`]): with
+    /// unified addressing CUDA resolves a host source by its start address
+    /// and rejects (`cudaErrorInvalidValue`) a copy that starts inside one
+    /// registered range and runs past its end, so each copy must stay within
+    /// a single registration, or entirely outside any.
+    pub(crate) fn copy_segments_from_host_async_on(
+        &mut self,
+        stream: cuvs_sys::cudaStream_t,
+        src: &[T],
+        segments: &[std::ops::Range<usize>],
+    ) -> Result<()> {
+        let expected_len = self.current_len();
+        if src.len() != expected_len {
+            return Err(Error::io(format!(
+                "device tensor copy expects {expected_len} elements, got {}",
+                src.len()
+            )));
+        }
+        let total = self.current_bytes();
+        let mut cursor = 0usize;
+        for segment in segments {
+            if segment.start != cursor || segment.end < segment.start || segment.end > total {
+                return Err(Error::io(format!(
+                    "copy segments do not tile the {total}-byte source: {segments:?}"
+                )));
+            }
+            cursor = segment.end;
+        }
+        if cursor != total {
+            return Err(Error::io(format!(
+                "copy segments do not tile the {total}-byte source: {segments:?}"
+            )));
+        }
+        let dst = self.tensor.dl_tensor.data.cast::<u8>();
+        let src_bytes = src.as_ptr().cast::<u8>();
+        for segment in segments {
+            check_cuda(
+                unsafe {
+                    cuvs_sys::cudaMemcpyAsync(
+                        dst.add(segment.start).cast(),
+                        src_bytes.add(segment.start).cast(),
+                        segment.end - segment.start,
+                        cuvs_sys::cudaMemcpyKind_cudaMemcpyDefault,
+                        stream,
+                    )
+                },
+                "copy host tensor segment to device",
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn copy_to_host_async(&self, resources: &Resources, dst: &mut [T]) -> Result<()> {
         let expected_len = self.current_len();
         if dst.len() != expected_len {
@@ -372,6 +429,219 @@ impl Drop for RegisteredHostBuffer {
         if !self.ptr.is_null() {
             let _ = unsafe { cudaHostUnregister(self.ptr) };
         }
+    }
+}
+
+/// Result of [`RegistrationCache::cover`].
+pub(crate) struct CacheCover {
+    /// Byte ranges relative to the buffer's start, tiling it in order. Each
+    /// lies entirely within one registered range or entirely outside any, so
+    /// one H2D copy per segment is valid. Usually a single segment.
+    pub(crate) segments: Vec<std::ops::Range<usize>>,
+    pub(crate) new_registrations: usize,
+    pub(crate) new_bytes: usize,
+    /// Gaps whose `cudaHostRegister` failed; their segments are copied from
+    /// pageable memory (valid, since they lie outside every registration).
+    pub(crate) failed_gaps: usize,
+}
+
+/// Keeps host memory registered with CUDA across batches instead of
+/// registering and unregistering every batch's decoded buffer.
+///
+/// Per-batch `cudaHostRegister`/`cudaHostUnregister` costs ~2.5-4 s per scan
+/// stage and, with transform overlap on, contends with the transform itself
+/// (`transform_s` ~5.3 s vs ~4.2 s with this cache). Measured, most of the
+/// gain comes from never unregistering during the stage, not from reuse:
+/// only ~15-23 of 64 batches land entirely inside earlier registrations.
+///
+/// Registered ranges are page-aligned and never overlap. For each buffer,
+/// [`Self::cover`] registers only the parts of its page-aligned range not
+/// already covered, and splits the buffer into copy segments at registration
+/// boundaries. That split is required, not an optimization: with unified
+/// addressing CUDA resolves a host source by its start address, so a single
+/// copy that starts inside one registration and runs past its end fails with
+/// `cudaErrorInvalidValue` (observed with an earlier version that copied such
+/// buffers from pageable memory in one piece).
+///
+/// **Only safe if freed memory is never returned to the OS during the
+/// stage.** If a registered range were unmapped and the same virtual
+/// addresses later handed out again with different physical pages, the
+/// GPU would DMA from the stale pinned pages -- silently wrong data. Enable
+/// it only after [`jemalloc_never_releases_memory`] succeeds.
+pub(crate) struct RegistrationCache {
+    // start -> end of each registered, page-aligned range.
+    ranges: Mutex<BTreeMap<usize, usize>>,
+}
+
+impl RegistrationCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            ranges: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<usize, usize>> {
+        self.ranges.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Registers whatever part of `slice`'s pages is not yet registered and
+    /// returns how to copy it. Holds the lock across `cudaHostRegister`:
+    /// simpler than tracking in-progress ranges (which could otherwise
+    /// produce exactly the partial overlaps this must avoid), and cheap in
+    /// practice since registrations already serialize inside the driver.
+    pub(crate) fn cover<T>(&self, slice: &[T]) -> Result<CacheCover> {
+        let bytes = std::mem::size_of_val(slice);
+        if bytes == 0 {
+            return Ok(CacheCover {
+                segments: vec![0..0],
+                new_registrations: 0,
+                new_bytes: 0,
+                failed_gaps: 0,
+            });
+        }
+        let page_size = page_size()?;
+        let start = slice.as_ptr() as usize;
+        let end = start
+            .checked_add(bytes)
+            .ok_or_else(|| Error::io("registration cache range overflow"))?;
+        let aligned_start = start & !(page_size - 1);
+        let aligned_end = end
+            .checked_add(page_size - 1)
+            .ok_or_else(|| Error::io("registration cache alignment overflow"))?
+            & !(page_size - 1);
+
+        let mut ranges = self.lock();
+        // Registered ranges intersecting [aligned_start, aligned_end).
+        let mut registered: Vec<(usize, usize)> = Vec::new();
+        if let Some((&range_start, &range_end)) = ranges.range(..aligned_start).next_back() {
+            if range_end > aligned_start {
+                registered.push((range_start, range_end));
+            }
+        }
+        registered.extend(
+            ranges
+                .range(aligned_start..aligned_end)
+                .map(|(&range_start, &range_end)| (range_start, range_end)),
+        );
+        // Uncovered gaps, page-aligned since every range is.
+        let mut gaps = Vec::new();
+        let mut cursor = aligned_start;
+        for &(range_start, range_end) in &registered {
+            if range_start > cursor {
+                gaps.push((cursor, range_start));
+            }
+            cursor = cursor.max(range_end);
+        }
+        if cursor < aligned_end {
+            gaps.push((cursor, aligned_end));
+        }
+
+        let mut cover = CacheCover {
+            segments: Vec::new(),
+            new_registrations: 0,
+            new_bytes: 0,
+            failed_gaps: 0,
+        };
+        for (gap_start, gap_end) in gaps {
+            let status =
+                unsafe { cudaHostRegister(gap_start as *mut c_void, gap_end - gap_start, 0) };
+            if status == cuvs_sys::cudaError::cudaSuccess {
+                ranges.insert(gap_start, gap_end);
+                registered.push((gap_start, gap_end));
+                cover.new_registrations += 1;
+                cover.new_bytes += gap_end - gap_start;
+            } else {
+                // Not sticky; this gap stays unregistered and its segment is
+                // copied from pageable memory.
+                cover.failed_gaps += 1;
+            }
+        }
+        drop(ranges);
+
+        // Split at every registration boundary strictly inside the buffer.
+        let mut cuts: Vec<usize> = registered
+            .iter()
+            .flat_map(|&(range_start, range_end)| [range_start, range_end])
+            .filter(|&cut| cut > start && cut < end)
+            .collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut previous = start;
+        for cut in cuts.into_iter().chain(std::iter::once(end)) {
+            cover.segments.push((previous - start)..(cut - start));
+            previous = cut;
+        }
+        Ok(cover)
+    }
+
+    /// Unregisters every range. Call only once no copy can still be reading
+    /// from any of them. Returns (ranges, bytes).
+    pub(crate) fn unregister_all(&self) -> (usize, usize) {
+        let mut ranges = self.lock();
+        let mut bytes = 0;
+        for (&range_start, &range_end) in ranges.iter() {
+            let _ = unsafe { cudaHostUnregister(range_start as *mut c_void) };
+            bytes += range_end - range_start;
+        }
+        let count = ranges.len();
+        ranges.clear();
+        (count, bytes)
+    }
+}
+
+impl Drop for RegistrationCache {
+    fn drop(&mut self) {
+        self.unregister_all();
+    }
+}
+
+type Mallctl =
+    unsafe extern "C" fn(*const c_char, *mut c_void, *mut usize, *mut c_void, usize) -> c_int;
+
+fn mallctl_read<T: Copy + Default>(mallctl: Mallctl, name: &CStr) -> Option<T> {
+    let mut value = T::default();
+    let mut len = std::mem::size_of::<T>();
+    let rc = unsafe {
+        mallctl(
+            name.as_ptr(),
+            (&mut value as *mut T).cast::<c_void>(),
+            &mut len,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && len == std::mem::size_of::<T>()).then_some(value)
+}
+
+/// Checks that the process allocator is jemalloc configured never to give
+/// freed memory back to the OS during the run -- the precondition for
+/// [`RegistrationCache`]. Reads the live settings through jemalloc's
+/// `mallctl` rather than trusting environment variables: requires
+/// `opt.retain` (no `munmap` of freed extents), `opt.dirty_decay_ms` and
+/// `opt.muzzy_decay_ms` of -1 (no purging, so no `madvise` that would detach
+/// pinned physical pages from their virtual addresses), and
+/// `opt.oversize_threshold` of 0 (no separate oversize arena with its own
+/// purging). Returns why not, otherwise.
+pub(crate) fn jemalloc_never_releases_memory() -> std::result::Result<(), String> {
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mallctl".as_ptr()) };
+    if symbol.is_null() {
+        return Err("jemalloc is not loaded (no `mallctl` symbol in the process); \
+                    glibc unmaps large freed buffers"
+            .to_string());
+    }
+    let mallctl: Mallctl = unsafe { std::mem::transmute(symbol) };
+    let retain = mallctl_read::<bool>(mallctl, c"opt.retain");
+    let dirty = mallctl_read::<isize>(mallctl, c"opt.dirty_decay_ms");
+    let muzzy = mallctl_read::<isize>(mallctl, c"opt.muzzy_decay_ms");
+    let oversize = mallctl_read::<usize>(mallctl, c"opt.oversize_threshold");
+    match (retain, dirty, muzzy, oversize) {
+        (Some(true), Some(-1), Some(-1), Some(0)) => Ok(()),
+        _ => Err(format!(
+            "jemalloc may return memory to the OS (opt.retain={retain:?}, \
+             opt.dirty_decay_ms={dirty:?}, opt.muzzy_decay_ms={muzzy:?}, \
+             opt.oversize_threshold={oversize:?}); set MALLOC_CONF=\
+             dirty_decay_ms:-1,muzzy_decay_ms:-1,oversize_threshold:0 (retain is the Linux default)"
+        )),
     }
 }
 
