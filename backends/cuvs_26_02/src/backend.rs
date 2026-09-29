@@ -49,6 +49,10 @@ const DEFAULT_SAMPLE_PREFAULT_THREADS: usize = 8;
 // Transform slots with LANCE_CUVS_TRANSFORM_OVERLAP=1: one transforming, one
 // whose H2D is already enqueued on the copy stream, one being drained.
 const TRANSFORM_OVERLAP_SLOTS: usize = 3;
+// Transformed batches queued for the artifact append task
+// (LANCE_CUVS_APPEND_QUEUE_DEPTH). Each holds row ids, partition ids and PQ
+// codes, ~35 MB for a 131,072-row batch with 256-byte codes.
+const DEFAULT_APPEND_QUEUE_DEPTH: usize = 16;
 
 /// A trained cuVS IVF_PQ model that can be reused for artifact builds.
 ///
@@ -822,6 +826,18 @@ fn prepare_workers_from_env() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|workers| *workers > 0)
         .unwrap_or(DEFAULT_PREPARE_WORKERS)
+}
+
+/// `LANCE_CUVS_APPEND_QUEUE_DEPTH`: how many transformed batches may wait for
+/// the artifact append task. The append task keeps up on average but not
+/// with bursts; a shallow queue makes the transform drain block, which
+/// holds transform slots back from the GPU.
+fn append_queue_depth_from_env() -> usize {
+    std::env::var("LANCE_CUVS_APPEND_QUEUE_DEPTH")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|depth| *depth > 0)
+        .unwrap_or(DEFAULT_APPEND_QUEUE_DEPTH)
 }
 
 fn sample_prefault_threads_from_env() -> usize {
@@ -1647,6 +1663,7 @@ fn drain_transformed_slots(
 async fn append_artifact_batches(
     mut artifact: PartitionArtifactBuilder,
     mut rx: mpsc::Receiver<Result<RecordBatch>>,
+    queue_depth: usize,
 ) -> Result<Vec<String>> {
     let mut batches = 0usize;
     let mut rows = 0usize;
@@ -1666,7 +1683,8 @@ async fn append_artifact_batches(
         .await?;
     let finish_time = finish_start.elapsed();
     eprintln!(
-        "cuVS artifact append task: batches={} rows={} append_s={:.3} finish_s={:.3} files={}",
+        "cuVS artifact append task: queue_depth={} batches={} rows={} append_s={:.3} finish_s={:.3} files={}",
+        queue_depth,
         batches,
         rows,
         secs(append_time),
@@ -1890,8 +1908,13 @@ pub async fn assign_ivf_pq_to_artifact(
     )
     .await?;
 
-    let (mut append_tx, append_rx) = mpsc::channel::<Result<RecordBatch>>(PIPELINE_SLOTS);
-    let append_task = tokio::spawn(append_artifact_batches(artifact, append_rx));
+    let append_queue_depth = append_queue_depth_from_env();
+    let (mut append_tx, append_rx) = mpsc::channel::<Result<RecordBatch>>(append_queue_depth);
+    let append_task = tokio::spawn(append_artifact_batches(
+        artifact,
+        append_rx,
+        append_queue_depth,
+    ));
 
     let append_start = Instant::now();
     let append_result = append_transformed_batches_to_artifact(
