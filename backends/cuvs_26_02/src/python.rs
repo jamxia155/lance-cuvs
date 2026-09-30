@@ -102,6 +102,41 @@ fn parse_distance_type(metric: &str) -> PyResult<DistanceType> {
     }
 }
 
+/// `LANCE_CUVS_DIRECT_IO=1` (or `true`): open a local dataset through Lance's
+/// `file+direct://` scheme, so this backend's dataset reads (the training
+/// sample and the artifact scan) use O_DIRECT and bypass the page cache.
+/// Buffered reads of a large dataset at high concurrency are limited by
+/// page-cache locking rather than the drives. Only this backend's own dataset
+/// handle changes: the artifact it writes, and Lance's merge that reads it,
+/// keep their buffered `file://` stores. Non-local URIs are left unchanged.
+fn dataset_uri_for_reads(dataset_uri: &str) -> String {
+    let enabled = matches!(
+        std::env::var("LANCE_CUVS_DIRECT_IO").ok().as_deref(),
+        Some("1") | Some("true")
+    );
+    if !enabled {
+        return dataset_uri.to_string();
+    }
+    let local_path = if let Some(path) = dataset_uri.strip_prefix("file://") {
+        path.to_string()
+    } else if dataset_uri.contains("://") {
+        eprintln!(
+            "cuVS dataset reads: LANCE_CUVS_DIRECT_IO ignored for non-local dataset {dataset_uri}"
+        );
+        return dataset_uri.to_string();
+    } else {
+        match std::fs::canonicalize(dataset_uri) {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            // Let the dataset load report the problem.
+            Err(_) => return dataset_uri.to_string(),
+        }
+    };
+    eprintln!(
+        "cuVS dataset reads: O_DIRECT via file+direct://{local_path} (LANCE_CUVS_DIRECT_IO)"
+    );
+    format!("file+direct://{local_path}")
+}
+
 #[pyfunction]
 #[pyo3(
     signature = (
@@ -138,7 +173,7 @@ fn train_ivf_pq_py(
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
 
-    let mut builder = DatasetBuilder::from_uri(dataset_uri);
+    let mut builder = DatasetBuilder::from_uri(&dataset_uri_for_reads(dataset_uri));
     if let Some(storage_options) = storage_options {
         builder = builder.with_storage_options(storage_options);
     }
@@ -190,7 +225,7 @@ fn build_ivf_pq_artifact<'py>(
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
 
-    let mut builder = DatasetBuilder::from_uri(dataset_uri);
+    let mut builder = DatasetBuilder::from_uri(&dataset_uri_for_reads(dataset_uri));
     if let Some(storage_options) = storage_options.clone() {
         builder = builder.with_storage_options(storage_options);
     }
