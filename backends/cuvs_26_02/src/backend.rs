@@ -911,6 +911,16 @@ fn scan_io_buffer_size_from_env() -> u64 {
     bytes.max(MIN_BYTES)
 }
 
+/// `LANCE_CUVS_SCAN_FRAGMENT_WINDOW`: scan this many fragments at a time (0 or
+/// unset: one scan over all fragments). Bounds how much of the dataset is
+/// read ahead of the GPU; see `scan_transform_batches`.
+fn scan_fragment_window_from_env() -> usize {
+    std::env::var("LANCE_CUVS_SCAN_FRAGMENT_WINDOW")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
 fn scan_batch_readahead_from_env() -> usize {
     std::env::var("LANCE_CUVS_SCAN_BATCH_READAHEAD")
         .ok()
@@ -1053,46 +1063,72 @@ async fn scan_transform_batches(
     filter_nan: bool,
     mut raw_tx: mpsc::Sender<RecordBatch>,
 ) -> Result<ArtifactScannerStats> {
-    let mut scanner = dataset.scan();
-    scanner.project(&[&column])?;
-    if dataset
-        .schema()
-        .field(&column)
-        .is_some_and(|field| field.nullable && filter_nan)
-    {
-        scanner.filter(&format!("{column} is not null"))?;
-    }
-    scanner.with_row_id();
-    scanner.batch_size(batch_size);
-    scanner.scan_in_order(false);
     let fragment_readahead = scan_fragment_readahead_from_env();
     let io_buffer_size = scan_io_buffer_size_from_env();
     eprintln!(
         "cuVS artifact scan: fragment_readahead={fragment_readahead} io_buffer_gib={:.3}",
         io_buffer_size as f64 / (1u64 << 30) as f64
     );
-    scanner.fragment_readahead(fragment_readahead);
-    scanner.batch_readahead(scan_batch_readahead_from_env());
-    scanner.io_buffer_size(io_buffer_size);
-    let mut stream = scanner.try_into_stream().await?;
+    // Lance reads every page of a fragment as soon as the fragment is opened,
+    // and its scan workers move on to the next fragment long before the
+    // consumer has used the batches. When reads are faster than the GPU, one
+    // scan over the whole dataset therefore ends up holding most of it in
+    // memory. Scanning a few fragments at a time bounds that to the window.
+    let window = scan_fragment_window_from_env();
+    let fragments = dataset.fragments().as_ref().clone();
+    let windows: Vec<Option<Vec<_>>> = if window == 0 || window >= fragments.len() {
+        vec![None]
+    } else {
+        eprintln!(
+            "cuVS artifact scan: fragment_window={window} ({} windows over {} fragments)",
+            fragments.len().div_ceil(window),
+            fragments.len()
+        );
+        fragments
+            .chunks(window)
+            .map(|chunk| Some(chunk.to_vec()))
+            .collect()
+    };
     let mut stats = ArtifactScannerStats::default();
 
-    loop {
-        let scan_start = Instant::now();
-        let Some(batch) = stream.try_next().await? else {
-            stats.scan_wait += scan_start.elapsed();
-            break;
-        };
-        stats.scan_wait += scan_start.elapsed();
-        stats.input_batches += 1;
-        stats.input_rows += batch.num_rows();
+    for window_fragments in windows {
+        let mut scanner = dataset.scan();
+        if let Some(window_fragments) = window_fragments {
+            scanner.with_fragments(window_fragments);
+        }
+        scanner.project(&[&column])?;
+        if dataset
+            .schema()
+            .field(&column)
+            .is_some_and(|field| field.nullable && filter_nan)
+        {
+            scanner.filter(&format!("{column} is not null"))?;
+        }
+        scanner.with_row_id();
+        scanner.batch_size(batch_size);
+        scanner.scan_in_order(false);
+        scanner.fragment_readahead(fragment_readahead);
+        scanner.batch_readahead(scan_batch_readahead_from_env());
+        scanner.io_buffer_size(io_buffer_size);
+        let mut stream = scanner.try_into_stream().await?;
 
-        let send_start = Instant::now();
-        raw_tx
-            .send(batch)
-            .await
-            .map_err(|error| Error::io(format!("failed to forward raw batch: {error}")))?;
-        stats.send += send_start.elapsed();
+        loop {
+            let scan_start = Instant::now();
+            let Some(batch) = stream.try_next().await? else {
+                stats.scan_wait += scan_start.elapsed();
+                break;
+            };
+            stats.scan_wait += scan_start.elapsed();
+            stats.input_batches += 1;
+            stats.input_rows += batch.num_rows();
+
+            let send_start = Instant::now();
+            raw_tx
+                .send(batch)
+                .await
+                .map_err(|error| Error::io(format!("failed to forward raw batch: {error}")))?;
+            stats.send += send_start.elapsed();
+        }
     }
 
     Ok(stats)
