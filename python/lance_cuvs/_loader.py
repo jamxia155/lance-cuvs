@@ -21,6 +21,10 @@ class BackendSpec:
     runtime_distribution: str
     runtime_major: int
     runtime_minor: int
+    # Whether to preload librmm/libraft/libcuvs/libcuvs_c from the installed
+    # RAPIDS Python packages. Off for backends built against a local cuVS
+    # checkout, whose own (newer) libraries must resolve instead.
+    preload_rapids_packages: bool = True
 
 
 @dataclass(frozen=True)
@@ -37,6 +41,19 @@ SUPPORTED_BACKENDS: dict[str, BackendSpec] = {
         runtime_distribution="libcuvs-cu12",
         runtime_major=26,
         runtime_minor=2,
+    ),
+    # Built against a local cuVS checkout (backends/cuvs_local) instead of a
+    # published release. It shares cu12's runtime distribution, and cu12 is
+    # matched first in backend_key_for_runtime, so it is never auto-detected:
+    # select it with LANCE_CUVS_BACKEND=cu12-local.
+    "cu12_local": BackendSpec(
+        key="cu12_local",
+        module="lance_cuvs_backend_cu12_local",
+        distribution="pylance-cuvs-cu12-local",
+        runtime_distribution="libcuvs-cu12",
+        runtime_major=26,
+        runtime_minor=12,
+        preload_rapids_packages=False,
     ),
 }
 
@@ -149,7 +166,7 @@ def _library_candidates(root: Path, selectors: tuple[str, ...]) -> list[Path]:
     return candidates
 
 
-def _preload_shared_libraries() -> None:
+def _preload_shared_libraries(include_rapids_packages: bool = True) -> None:
     global _PRELOAD_DONE
     if _PRELOAD_DONE:
         return
@@ -159,22 +176,9 @@ def _preload_shared_libraries() -> None:
             _cuda_library_roots(),
             ("libcudart.so.12", "libcudart.so.12*", "libcudart.so", "libcudart.so*"),
         ),
-        (
-            _runtime_library_roots(),
-            (
-                "librapids_logger.so",
-                "librapids_logger.so*",
-                "librapids_logger-*.so*",
-            ),
-        ),
-        (_runtime_library_roots(), ("librmm.so", "librmm.so*", "librmm-*.so*")),
-        (_runtime_library_roots(), ("libraft.so", "libraft.so*", "libraft-*.so*")),
-        (_runtime_library_roots(), ("libcuvs.so", "libcuvs.so*", "libcuvs-*.so*")),
-        (
-            _runtime_library_roots(),
-            ("libcuvs_c.so", "libcuvs_c.so*", "libcuvs_c-*.so*"),
-        ),
     ]
+    if include_rapids_packages:
+        candidate_groups += _rapids_package_candidate_groups()
 
     loaded: list[str] = []
     failures: list[str] = []
@@ -200,6 +204,26 @@ def _preload_shared_libraries() -> None:
             "Failed to preload required cuVS shared libraries. "
             + " | ".join(failures[:8])
         )
+
+
+def _rapids_package_candidate_groups() -> list[tuple[list[Path], tuple[str, ...]]]:
+    return [
+        (
+            _runtime_library_roots(),
+            (
+                "librapids_logger.so",
+                "librapids_logger.so*",
+                "librapids_logger-*.so*",
+            ),
+        ),
+        (_runtime_library_roots(), ("librmm.so", "librmm.so*", "librmm-*.so*")),
+        (_runtime_library_roots(), ("libraft.so", "libraft.so*", "libraft-*.so*")),
+        (_runtime_library_roots(), ("libcuvs.so", "libcuvs.so*", "libcuvs-*.so*")),
+        (
+            _runtime_library_roots(),
+            ("libcuvs_c.so", "libcuvs_c.so*", "libcuvs_c-*.so*"),
+        ),
+    ]
 
 
 def _supported_backend_summary() -> str:
@@ -289,7 +313,7 @@ def load_backend() -> ModuleType:
         return _BACKEND
 
     spec = resolve_backend()
-    _preload_shared_libraries()
+    _preload_shared_libraries(spec.preload_rapids_packages)
 
     try:
         _BACKEND = importlib.import_module(spec.module)

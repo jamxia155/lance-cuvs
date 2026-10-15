@@ -4,3 +4,5 @@ dist/
 __pycache__/
 python/**/__pycache__/
 *.pyc
+# Extension modules `maturin develop` builds into the backend packages.
+backends/*/python/**/_native*.so

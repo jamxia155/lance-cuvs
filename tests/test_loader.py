@@ -22,6 +22,8 @@ def test_normalize_backend_override() -> None:
     assert _loader._normalize_backend_key("lance-cuvs-backend-cuvs-26-02") == "cu12"
     assert _loader._normalize_backend_key("cuvs-26-02") == "cu12"
     assert _loader._normalize_backend_key("cuvs_26_02") == "cu12"
+    assert _loader._normalize_backend_key("cu12-local") == "cu12_local"
+    assert _loader._normalize_backend_key("pylance-cuvs-cu12-local") == "cu12_local"
 
 
 def test_resolve_backend_from_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -60,7 +62,7 @@ def test_load_backend_imports_selected_module(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setenv("LANCE_CUVS_BACKEND", "cu12")
     monkeypatch.setattr(_loader, "_BACKEND", None)
-    monkeypatch.setattr(_loader, "_preload_shared_libraries", lambda: None)
+    monkeypatch.setattr(_loader, "_preload_shared_libraries", lambda *args: None)
     monkeypatch.setattr(_loader.importlib, "import_module", lambda name: backend)
 
     loaded = _loader.load_backend()
@@ -108,3 +110,26 @@ def test_preload_shared_libraries_prefers_first_matching_root(
         str(first / "libcuvs.so"),
         str(first / "libcuvs_c.so"),
     ]
+
+
+def test_preload_shared_libraries_skips_rapids_packages_for_local_backend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    for name in ("libcudart.so.12", "librmm.so", "libcuvs_c.so"):
+        (tmp_path / name).write_bytes(b"")
+
+    calls: list[str] = []
+
+    def fake_cdll(path: str, *, mode: int) -> object:
+        calls.append(path)
+        return object()
+
+    monkeypatch.setattr(_loader, "_PRELOAD_DONE", False)
+    monkeypatch.setattr(_loader, "_cuda_library_roots", lambda: [tmp_path])
+    monkeypatch.setattr(_loader, "_runtime_library_roots", lambda: [tmp_path])
+    monkeypatch.setattr(_loader.ctypes, "CDLL", fake_cdll)
+
+    spec = _loader.SUPPORTED_BACKENDS["cu12_local"]
+    _loader._preload_shared_libraries(spec.preload_rapids_packages)
+
+    assert calls == [str(tmp_path / "libcudart.so.12")]

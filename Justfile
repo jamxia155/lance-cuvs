@@ -7,6 +7,15 @@ rapids_env := "export CMAKE=\"$(" + cmake_cmd + ")\"; eval \"$(" + uv_project + 
 dist_dir := root + "/dist"
 backend_wheel_compatibility := "manylinux_2_28"
 
+# Install prefix of the local cuVS checkout's `build.sh` (cuvs_local backend).
+cuvs_local_install := env_var_or_default("CUVS_LOCAL_INSTALL_PREFIX", root + "/../cuvs/install")
+# rapids_env exports cuvs_DIR (and raft/rmm/... *_DIR) for the pip libcuvs-cu12
+# package; CMake's find_package treats a set cuvs_DIR as authoritative, so point
+# it at the local install and drop the other hints. cuvs-sys's build script
+# runs bare `cmake` from PATH, and the local install needs CMake >= 4.0, so put
+# the project venv's cmake first.
+local_rapids_env := rapids_env + "; export PATH=\"" + root + "/.venv/bin:$PATH\" CMAKE_PREFIX_PATH=\"" + cuvs_local_install + "${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}\" cuvs_DIR=\"" + cuvs_local_install + "/lib/cmake/cuvs\"; unset nvtx3_DIR raft_DIR rmm_DIR rapids_logger_DIR"
+
 default:
   @just --list
 
@@ -32,6 +41,9 @@ backend-wheel: sync-dev
 
 backend-develop: sync-dev
   {{rapids_env}} && cd backends/cuvs_26_02 && {{uv_project}} maturin develop --release --locked
+
+backend-local-develop: sync-dev
+  {{local_rapids_env}} && cd backends/cuvs_local && env -u CONDA_PREFIX {{uv_project}} maturin develop --release --locked
 
 build-wheels: sync-dev
   rm -rf dist
@@ -59,6 +71,18 @@ rust-check: sync-dev-no-project
   {{rapids_env}} && cargo check --manifest-path backends/cuvs_26_02/Cargo.toml --locked --all-targets --features python
 
 rust-build: rust-fmt-check rust-clippy rust-check
+  @:
+
+rust-local-fmt-check:
+  cargo fmt --manifest-path backends/cuvs_local/Cargo.toml --all --check
+
+rust-local-clippy: sync-dev-no-project
+  {{local_rapids_env}} && cargo clippy --manifest-path backends/cuvs_local/Cargo.toml --locked --all-targets --features python -- -D warnings
+
+rust-local-check: sync-dev-no-project
+  {{local_rapids_env}} && cargo check --manifest-path backends/cuvs_local/Cargo.toml --locked --all-targets --features python
+
+rust-local-build: rust-local-fmt-check rust-local-clippy rust-local-check
   @:
 
 test-loader-wheel:

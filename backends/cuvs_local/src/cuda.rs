@@ -1,0 +1,1180 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::{Array, FixedSizeListArray};
+use arrow_schema::DataType;
+use lance_arrow::FixedSizeListArrayExt;
+use lance_core::{Error, Result};
+use lance_linalg::distance::DistanceType;
+use ndarray::{Array2, ArrayView2};
+use std::collections::BTreeMap;
+use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
+use std::marker::PhantomData;
+use std::ptr;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+pub(crate) type CudaEventHandle = *mut c_void;
+
+// cuvs-sys on cuVS main blocklists `cuda.*` from its bindings and declares
+// only `cudaStream_t` and `cudaDataType_t` itself, so the cudart types and
+// functions this backend needs are declared here.
+pub(crate) type CudaError = c_uint;
+pub(crate) const CUDA_SUCCESS: CudaError = 0;
+pub(crate) type CudaMemcpyKind = c_uint;
+/// `cudaMemcpyDefault`: direction inferred from the pointers (UVA).
+const CUDA_MEMCPY_DEFAULT: CudaMemcpyKind = 4;
+
+#[link(name = "cudart")]
+unsafe extern "C" {
+    fn cudaGetErrorName(error: CudaError) -> *const c_char;
+    fn cudaMemcpyAsync(
+        dst: *mut c_void,
+        src: *const c_void,
+        count: usize,
+        kind: CudaMemcpyKind,
+        stream: cuvs_sys::cudaStream_t,
+    ) -> CudaError;
+    fn cudaMallocAsync(
+        ptr: *mut *mut c_void,
+        size: usize,
+        stream: cuvs_sys::cudaStream_t,
+    ) -> CudaError;
+    fn cudaFreeAsync(ptr: *mut c_void, stream: cuvs_sys::cudaStream_t) -> CudaError;
+    fn cudaMallocHost(ptr: *mut *mut c_void, size: usize) -> CudaError;
+    fn cudaFreeHost(ptr: *mut c_void) -> CudaError;
+    fn cudaHostRegister(ptr: *mut c_void, size: usize, flags: u32) -> CudaError;
+    fn cudaHostUnregister(ptr: *mut c_void) -> CudaError;
+    fn cudaMemcpy2DAsync(
+        dst: *mut c_void,
+        dpitch: usize,
+        src: *const c_void,
+        spitch: usize,
+        width: usize,
+        height: usize,
+        kind: CudaMemcpyKind,
+        stream: cuvs_sys::cudaStream_t,
+    ) -> CudaError;
+    fn cudaEventCreate(event: *mut CudaEventHandle) -> CudaError;
+    fn cudaEventDestroy(event: CudaEventHandle) -> CudaError;
+    fn cudaEventRecord(
+        event: CudaEventHandle,
+        stream: cuvs_sys::cudaStream_t,
+    ) -> CudaError;
+    fn cudaEventSynchronize(event: CudaEventHandle) -> CudaError;
+    fn cudaEventElapsedTime(
+        ms: *mut f32,
+        start: CudaEventHandle,
+        end: CudaEventHandle,
+    ) -> CudaError;
+    fn cudaStreamCreateWithFlags(
+        stream: *mut cuvs_sys::cudaStream_t,
+        flags: u32,
+    ) -> CudaError;
+    fn cudaStreamDestroy(stream: cuvs_sys::cudaStream_t) -> CudaError;
+    fn cudaStreamWaitEvent(
+        stream: cuvs_sys::cudaStream_t,
+        event: CudaEventHandle,
+        flags: u32,
+    ) -> CudaError;
+}
+
+/// `cudaStreamNonBlocking`: no implicit synchronization with the legacy
+/// default stream.
+const CUDA_STREAM_NON_BLOCKING: u32 = 0x01;
+
+/// Owns a `cuvsResources_t`. `cuvs::Resources` on cuVS main keeps its raw
+/// handle private to the `cuvs` crate, and this backend calls the C API
+/// directly, so it owns the handle itself.
+pub(crate) struct Resources(pub(crate) cuvs_sys::cuvsResources_t);
+
+impl Resources {
+    pub(crate) fn new() -> Result<Self> {
+        let mut handle: cuvs_sys::cuvsResources_t = 0;
+        check_cuvs(
+            unsafe { cuvs_sys::cuvsResourcesCreate(&mut handle) },
+            "create cuVS resources",
+        )?;
+        Ok(Self(handle))
+    }
+
+    pub(crate) fn get_cuda_stream(&self) -> Result<cuvs_sys::cudaStream_t> {
+        let mut stream = ptr::null_mut();
+        check_cuvs(
+            unsafe { cuvs_sys::cuvsStreamGet(self.0, &mut stream) },
+            "get cuVS resources CUDA stream",
+        )?;
+        Ok(stream)
+    }
+
+    pub(crate) fn sync_stream(&self) -> Result<()> {
+        check_cuvs(
+            unsafe { cuvs_sys::cuvsStreamSync(self.0) },
+            "sync cuVS resources CUDA stream",
+        )
+    }
+}
+
+impl Drop for Resources {
+    fn drop(&mut self) {
+        let _ = unsafe { cuvs_sys::cuvsResourcesDestroy(self.0) };
+    }
+}
+
+pub(crate) struct CuvsIvfPqIndex {
+    pub(crate) raw: cuvs_sys::cuvsIvfPqIndex_t,
+}
+
+impl CuvsIvfPqIndex {
+    pub(crate) fn try_new() -> Result<Self> {
+        let mut raw = ptr::null_mut();
+        check_cuvs(
+            unsafe { cuvs_sys::cuvsIvfPqIndexCreate(&mut raw) },
+            "create IVF_PQ index",
+        )?;
+        Ok(Self { raw })
+    }
+}
+
+impl Drop for CuvsIvfPqIndex {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            let _ = unsafe { cuvs_sys::cuvsIvfPqIndexDestroy(self.raw) };
+        }
+    }
+}
+
+pub(crate) enum MatrixBuffer<'a> {
+    Borrowed {
+        values: &'a [f32],
+        rows: usize,
+        cols: usize,
+    },
+    Owned(Array2<f32>),
+}
+
+impl MatrixBuffer<'_> {
+    pub(crate) fn view(&self) -> Result<ArrayView2<'_, f32>> {
+        match self {
+            Self::Borrowed { values, rows, cols } => ArrayView2::from_shape((*rows, *cols), values)
+                .map_err(|error| {
+                    Error::io(format!("failed to create borrowed matrix view: {error}"))
+                }),
+            Self::Owned(array) => Ok(array.view()),
+        }
+    }
+}
+
+pub(crate) struct HostTensorView {
+    shape: Vec<i64>,
+    tensor: cuvs_sys::DLManagedTensor,
+}
+
+impl HostTensorView {
+    pub(crate) fn try_new<T: DlElement>(shape: &[usize], data: *mut c_void) -> Self {
+        let shape = shape.iter().map(|dim| *dim as i64).collect::<Vec<_>>();
+        let tensor = cuvs_sys::DLManagedTensor {
+            dl_tensor: cuvs_sys::DLTensor {
+                data,
+                device: cuvs_sys::DLDevice {
+                    device_type: cuvs_sys::DLDeviceType::kDLCPU,
+                    device_id: 0,
+                },
+                ndim: shape.len() as i32,
+                dtype: T::dl_dtype(),
+                shape: shape.as_ptr() as *mut i64,
+                strides: ptr::null_mut(),
+                byte_offset: 0,
+            },
+            manager_ctx: ptr::null_mut(),
+            deleter: None,
+        };
+        Self { shape, tensor }
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut cuvs_sys::DLManagedTensor {
+        debug_assert_eq!(self.shape.len(), self.tensor.dl_tensor.ndim as usize);
+        &mut self.tensor
+    }
+
+    pub(crate) fn tensor(&self) -> &cuvs_sys::DLManagedTensor {
+        &self.tensor
+    }
+}
+
+pub(crate) trait DlElement: Copy + Default {
+    fn dl_dtype() -> cuvs_sys::DLDataType;
+}
+
+impl DlElement for f32 {
+    fn dl_dtype() -> cuvs_sys::DLDataType {
+        cuvs_sys::DLDataType {
+            code: cuvs_sys::DLDataTypeCode::kDLFloat as u8,
+            bits: 32,
+            lanes: 1,
+        }
+    }
+}
+
+impl DlElement for u8 {
+    fn dl_dtype() -> cuvs_sys::DLDataType {
+        cuvs_sys::DLDataType {
+            code: cuvs_sys::DLDataTypeCode::kDLUInt as u8,
+            bits: 8,
+            lanes: 1,
+        }
+    }
+}
+
+impl DlElement for u32 {
+    fn dl_dtype() -> cuvs_sys::DLDataType {
+        cuvs_sys::DLDataType {
+            code: cuvs_sys::DLDataTypeCode::kDLUInt as u8,
+            bits: 32,
+            lanes: 1,
+        }
+    }
+}
+
+pub(crate) struct DeviceTensor<T: DlElement> {
+    shape: Vec<i64>,
+    tensor: cuvs_sys::DLManagedTensor,
+    capacity_bytes: usize,
+    /// Stream the buffer was allocated on; it is freed on the same stream.
+    stream: cuvs_sys::cudaStream_t,
+    _marker: PhantomData<T>,
+}
+
+impl<T: DlElement> DeviceTensor<T> {
+    pub(crate) fn try_new(resources: &Resources, shape: &[usize]) -> Result<Self> {
+        let capacity_bytes = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        // cuvsRMMAlloc on cuVS main draws from RAFT's workspace resource
+        // (transient scratch, capped at a fraction of device memory), not the
+        // current device resource as in 26.02, so allocate stream-ordered
+        // from CUDA's own pool instead.
+        let stream = resources.get_cuda_stream()?;
+        let mut data = ptr::null_mut();
+        check_cuda(
+            unsafe { cudaMallocAsync(&mut data, capacity_bytes, stream) },
+            "allocate device tensor",
+        )?;
+        let shape = shape.iter().map(|dim| *dim as i64).collect::<Vec<_>>();
+        let tensor = cuvs_sys::DLManagedTensor {
+            dl_tensor: cuvs_sys::DLTensor {
+                data,
+                device: cuvs_sys::DLDevice {
+                    device_type: cuvs_sys::DLDeviceType::kDLCUDA,
+                    device_id: 0,
+                },
+                ndim: shape.len() as i32,
+                dtype: T::dl_dtype(),
+                shape: shape.as_ptr() as *mut i64,
+                strides: ptr::null_mut(),
+                byte_offset: 0,
+            },
+            manager_ctx: ptr::null_mut(),
+            deleter: None,
+        };
+        Ok(Self {
+            shape,
+            tensor,
+            capacity_bytes,
+            stream,
+            _marker: PhantomData,
+        })
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut cuvs_sys::DLManagedTensor {
+        debug_assert_eq!(self.shape.len(), self.tensor.dl_tensor.ndim as usize);
+        &mut self.tensor
+    }
+
+    pub(crate) fn set_shape(&mut self, shape: &[usize]) -> Result<()> {
+        if shape.len() != self.shape.len() {
+            return Err(Error::io(format!(
+                "device tensor rank mismatch: expected {}, got {}",
+                self.shape.len(),
+                shape.len()
+            )));
+        }
+        let required_bytes = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        if required_bytes > self.capacity_bytes {
+            return Err(Error::io(format!(
+                "device tensor capacity {} bytes is smaller than requested shape {:?} ({} bytes)",
+                self.capacity_bytes, shape, required_bytes
+            )));
+        }
+        for (dst, src) in self.shape.iter_mut().zip(shape) {
+            *dst = *src as i64;
+        }
+        Ok(())
+    }
+
+    fn current_len(&self) -> usize {
+        self.shape.iter().map(|dim| *dim as usize).product()
+    }
+
+    fn current_bytes(&self) -> usize {
+        self.current_len() * std::mem::size_of::<T>()
+    }
+
+    /// Enqueues a host-to-device copy of `src` on `stream` -- the compute
+    /// stream, or a dedicated copy stream so the copy can overlap kernels on
+    /// the compute stream. The source must stay alive (and, for the copy to be
+    /// truly asynchronous, pinned) until the copy completes.
+    pub(crate) fn copy_from_host_async_on(
+        &mut self,
+        stream: cuvs_sys::cudaStream_t,
+        src: &[T],
+    ) -> Result<()> {
+        let expected_len = self.current_len();
+        if src.len() != expected_len {
+            return Err(Error::io(format!(
+                "device tensor copy expects {expected_len} elements, got {}",
+                src.len()
+            )));
+        }
+        check_cuda(
+            unsafe {
+                cudaMemcpyAsync(
+                    self.tensor.dl_tensor.data,
+                    src.as_ptr() as *const _,
+                    self.current_bytes(),
+                    CUDA_MEMCPY_DEFAULT,
+                    stream,
+                )
+            },
+            "copy host tensor to device",
+        )
+    }
+
+    /// Like [`Self::copy_from_host_async_on`], but issued as one copy per
+    /// segment. `segments` are byte ranges relative to `src`'s start that
+    /// must tile `[0, size_of_val(src))` in order. Used when `src` spans more
+    /// than one host registration (see [`RegistrationCache::cover`]): with
+    /// unified addressing CUDA resolves a host source by its start address
+    /// and rejects (`cudaErrorInvalidValue`) a copy that starts inside one
+    /// registered range and runs past its end, so each copy must stay within
+    /// a single registration, or entirely outside any.
+    pub(crate) fn copy_segments_from_host_async_on(
+        &mut self,
+        stream: cuvs_sys::cudaStream_t,
+        src: &[T],
+        segments: &[std::ops::Range<usize>],
+    ) -> Result<()> {
+        let expected_len = self.current_len();
+        if src.len() != expected_len {
+            return Err(Error::io(format!(
+                "device tensor copy expects {expected_len} elements, got {}",
+                src.len()
+            )));
+        }
+        let total = self.current_bytes();
+        let mut cursor = 0usize;
+        for segment in segments {
+            if segment.start != cursor || segment.end < segment.start || segment.end > total {
+                return Err(Error::io(format!(
+                    "copy segments do not tile the {total}-byte source: {segments:?}"
+                )));
+            }
+            cursor = segment.end;
+        }
+        if cursor != total {
+            return Err(Error::io(format!(
+                "copy segments do not tile the {total}-byte source: {segments:?}"
+            )));
+        }
+        let dst = self.tensor.dl_tensor.data.cast::<u8>();
+        let src_bytes = src.as_ptr().cast::<u8>();
+        for segment in segments {
+            check_cuda(
+                unsafe {
+                    cudaMemcpyAsync(
+                        dst.add(segment.start).cast(),
+                        src_bytes.add(segment.start).cast(),
+                        segment.end - segment.start,
+                        CUDA_MEMCPY_DEFAULT,
+                        stream,
+                    )
+                },
+                "copy host tensor segment to device",
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn copy_to_host_async(&self, resources: &Resources, dst: &mut [T]) -> Result<()> {
+        let expected_len = self.current_len();
+        if dst.len() != expected_len {
+            return Err(Error::io(format!(
+                "device tensor copy expects destination length {expected_len}, got {}",
+                dst.len()
+            )));
+        }
+        check_cuda(
+            unsafe {
+                cudaMemcpyAsync(
+                    dst.as_mut_ptr() as *mut _,
+                    self.tensor.dl_tensor.data,
+                    self.current_bytes(),
+                    CUDA_MEMCPY_DEFAULT,
+                    resources
+                        .get_cuda_stream()
+                        .map_err(|e| Error::io(e.to_string()))?,
+                )
+            },
+            "copy device tensor to host",
+        )
+    }
+}
+
+impl<T: DlElement> Drop for DeviceTensor<T> {
+    fn drop(&mut self) {
+        if !self.tensor.dl_tensor.data.is_null() {
+            let _ = unsafe { cudaFreeAsync(self.tensor.dl_tensor.data, self.stream) };
+        }
+    }
+}
+
+pub(crate) struct RegisteredHostBuffer {
+    ptr: *mut c_void,
+    original_bytes: usize,
+}
+
+// CUDA host registration owns a process-local address range; unregistering it
+// from the consumer task is safe because CUDA runtime calls are thread-safe.
+unsafe impl Send for RegisteredHostBuffer {}
+
+impl RegisteredHostBuffer {
+    pub(crate) fn try_new<T>(slice: &[T]) -> Result<Self> {
+        let original_bytes = std::mem::size_of_val(slice);
+        if original_bytes == 0 {
+            return Ok(Self {
+                ptr: ptr::null_mut(),
+                original_bytes: 0,
+            });
+        }
+
+        let page_size = page_size()?;
+        let start = slice.as_ptr() as usize;
+        let end = start
+            .checked_add(original_bytes)
+            .ok_or_else(|| Error::io("registered host buffer size overflow"))?;
+        let aligned_start = start & !(page_size - 1);
+        let aligned_end = end
+            .checked_add(page_size - 1)
+            .ok_or_else(|| Error::io("registered host buffer alignment overflow"))?
+            & !(page_size - 1);
+        let bytes = aligned_end - aligned_start;
+        let ptr = aligned_start as *mut c_void;
+
+        check_cuda(
+            unsafe { cudaHostRegister(ptr, bytes, 0) },
+            "register host buffer",
+        )?;
+        Ok(Self {
+            ptr,
+            original_bytes,
+        })
+    }
+
+    pub(crate) fn original_bytes(&self) -> usize {
+        self.original_bytes
+    }
+}
+
+impl Drop for RegisteredHostBuffer {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            let _ = unsafe { cudaHostUnregister(self.ptr) };
+        }
+    }
+}
+
+/// Result of [`RegistrationCache::cover`].
+pub(crate) struct CacheCover {
+    /// Byte ranges relative to the buffer's start, tiling it in order. Each
+    /// lies entirely within one registered range or entirely outside any, so
+    /// one H2D copy per segment is valid. Usually a single segment.
+    pub(crate) segments: Vec<std::ops::Range<usize>>,
+    pub(crate) new_registrations: usize,
+    pub(crate) new_bytes: usize,
+    /// Gaps whose `cudaHostRegister` failed; their segments are copied from
+    /// pageable memory (valid, since they lie outside every registration).
+    pub(crate) failed_gaps: usize,
+}
+
+/// Keeps host memory registered with CUDA across batches instead of
+/// registering and unregistering every batch's decoded buffer.
+///
+/// Per-batch `cudaHostRegister`/`cudaHostUnregister` costs ~2.5-4 s per scan
+/// stage and, with transform overlap on, contends with the transform itself
+/// (`transform_s` ~5.3 s vs ~4.2 s with this cache). Measured, most of the
+/// gain comes from never unregistering during the stage, not from reuse:
+/// only ~15-23 of 64 batches land entirely inside earlier registrations.
+///
+/// Registered ranges are page-aligned and never overlap. For each buffer,
+/// [`Self::cover`] registers only the parts of its page-aligned range not
+/// already covered, and splits the buffer into copy segments at registration
+/// boundaries. That split is required, not an optimization: with unified
+/// addressing CUDA resolves a host source by its start address, so a single
+/// copy that starts inside one registration and runs past its end fails with
+/// `cudaErrorInvalidValue` (observed with an earlier version that copied such
+/// buffers from pageable memory in one piece).
+///
+/// **Only safe if freed memory is never returned to the OS during the
+/// stage.** If a registered range were unmapped and the same virtual
+/// addresses later handed out again with different physical pages, the
+/// GPU would DMA from the stale pinned pages -- silently wrong data. Enable
+/// it only after [`jemalloc_never_releases_memory`] succeeds.
+pub(crate) struct RegistrationCache {
+    // start -> end of each registered, page-aligned range.
+    ranges: Mutex<BTreeMap<usize, usize>>,
+}
+
+impl RegistrationCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            ranges: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<usize, usize>> {
+        self.ranges.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Registers whatever part of `slice`'s pages is not yet registered and
+    /// returns how to copy it. Holds the lock across `cudaHostRegister`:
+    /// simpler than tracking in-progress ranges (which could otherwise
+    /// produce exactly the partial overlaps this must avoid), and cheap in
+    /// practice since registrations already serialize inside the driver.
+    pub(crate) fn cover<T>(&self, slice: &[T]) -> Result<CacheCover> {
+        let bytes = std::mem::size_of_val(slice);
+        if bytes == 0 {
+            return Ok(CacheCover {
+                segments: vec![0..0],
+                new_registrations: 0,
+                new_bytes: 0,
+                failed_gaps: 0,
+            });
+        }
+        let page_size = page_size()?;
+        let start = slice.as_ptr() as usize;
+        let end = start
+            .checked_add(bytes)
+            .ok_or_else(|| Error::io("registration cache range overflow"))?;
+        let aligned_start = start & !(page_size - 1);
+        let aligned_end = end
+            .checked_add(page_size - 1)
+            .ok_or_else(|| Error::io("registration cache alignment overflow"))?
+            & !(page_size - 1);
+
+        let mut ranges = self.lock();
+        // Registered ranges intersecting [aligned_start, aligned_end).
+        let mut registered: Vec<(usize, usize)> = Vec::new();
+        if let Some((&range_start, &range_end)) = ranges.range(..aligned_start).next_back() {
+            if range_end > aligned_start {
+                registered.push((range_start, range_end));
+            }
+        }
+        registered.extend(
+            ranges
+                .range(aligned_start..aligned_end)
+                .map(|(&range_start, &range_end)| (range_start, range_end)),
+        );
+        // Uncovered gaps, page-aligned since every range is.
+        let mut gaps = Vec::new();
+        let mut cursor = aligned_start;
+        for &(range_start, range_end) in &registered {
+            if range_start > cursor {
+                gaps.push((cursor, range_start));
+            }
+            cursor = cursor.max(range_end);
+        }
+        if cursor < aligned_end {
+            gaps.push((cursor, aligned_end));
+        }
+
+        let mut cover = CacheCover {
+            segments: Vec::new(),
+            new_registrations: 0,
+            new_bytes: 0,
+            failed_gaps: 0,
+        };
+        for (gap_start, gap_end) in gaps {
+            let status =
+                unsafe { cudaHostRegister(gap_start as *mut c_void, gap_end - gap_start, 0) };
+            if status == CUDA_SUCCESS {
+                ranges.insert(gap_start, gap_end);
+                registered.push((gap_start, gap_end));
+                cover.new_registrations += 1;
+                cover.new_bytes += gap_end - gap_start;
+            } else {
+                // Not sticky; this gap stays unregistered and its segment is
+                // copied from pageable memory.
+                cover.failed_gaps += 1;
+            }
+        }
+        drop(ranges);
+
+        // Split at every registration boundary strictly inside the buffer.
+        let mut cuts: Vec<usize> = registered
+            .iter()
+            .flat_map(|&(range_start, range_end)| [range_start, range_end])
+            .filter(|&cut| cut > start && cut < end)
+            .collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut previous = start;
+        for cut in cuts.into_iter().chain(std::iter::once(end)) {
+            cover.segments.push((previous - start)..(cut - start));
+            previous = cut;
+        }
+        Ok(cover)
+    }
+
+    /// Unregisters every range. Call only once no copy can still be reading
+    /// from any of them. Returns (ranges, bytes).
+    pub(crate) fn unregister_all(&self) -> (usize, usize) {
+        let mut ranges = self.lock();
+        let mut bytes = 0;
+        for (&range_start, &range_end) in ranges.iter() {
+            let _ = unsafe { cudaHostUnregister(range_start as *mut c_void) };
+            bytes += range_end - range_start;
+        }
+        let count = ranges.len();
+        ranges.clear();
+        (count, bytes)
+    }
+}
+
+impl Drop for RegistrationCache {
+    fn drop(&mut self) {
+        self.unregister_all();
+    }
+}
+
+type Mallctl =
+    unsafe extern "C" fn(*const c_char, *mut c_void, *mut usize, *mut c_void, usize) -> c_int;
+
+fn mallctl_read<T: Copy + Default>(mallctl: Mallctl, name: &CStr) -> Option<T> {
+    let mut value = T::default();
+    let mut len = std::mem::size_of::<T>();
+    let rc = unsafe {
+        mallctl(
+            name.as_ptr(),
+            (&mut value as *mut T).cast::<c_void>(),
+            &mut len,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && len == std::mem::size_of::<T>()).then_some(value)
+}
+
+/// Checks that the process allocator is jemalloc configured never to give
+/// freed memory back to the OS during the run -- the precondition for
+/// [`RegistrationCache`]. Reads the live settings through jemalloc's
+/// `mallctl` rather than trusting environment variables: requires
+/// `opt.retain` (no `munmap` of freed extents), `opt.dirty_decay_ms` and
+/// `opt.muzzy_decay_ms` of -1 (no purging, so no `madvise` that would detach
+/// pinned physical pages from their virtual addresses), and
+/// `opt.oversize_threshold` of 0 (no separate oversize arena with its own
+/// purging). Returns why not, otherwise.
+pub(crate) fn jemalloc_never_releases_memory() -> std::result::Result<(), String> {
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mallctl".as_ptr()) };
+    if symbol.is_null() {
+        return Err("jemalloc is not loaded (no `mallctl` symbol in the process); \
+                    glibc unmaps large freed buffers"
+            .to_string());
+    }
+    let mallctl: Mallctl = unsafe { std::mem::transmute(symbol) };
+    let retain = mallctl_read::<bool>(mallctl, c"opt.retain");
+    let dirty = mallctl_read::<isize>(mallctl, c"opt.dirty_decay_ms");
+    let muzzy = mallctl_read::<isize>(mallctl, c"opt.muzzy_decay_ms");
+    let oversize = mallctl_read::<usize>(mallctl, c"opt.oversize_threshold");
+    match (retain, dirty, muzzy, oversize) {
+        (Some(true), Some(-1), Some(-1), Some(0)) => Ok(()),
+        _ => Err(format!(
+            "jemalloc may return memory to the OS (opt.retain={retain:?}, \
+             opt.dirty_decay_ms={dirty:?}, opt.muzzy_decay_ms={muzzy:?}, \
+             opt.oversize_threshold={oversize:?}); set MALLOC_CONF=\
+             dirty_decay_ms:-1,muzzy_decay_ms:-1,oversize_threshold:0 (retain is the Linux default)"
+        )),
+    }
+}
+
+fn page_size() -> Result<usize> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return Err(Error::io("failed to resolve system page size"));
+    }
+    let page_size = page_size as usize;
+    if !page_size.is_power_of_two() {
+        return Err(Error::io(format!(
+            "system page size {page_size} is not a power of two"
+        )));
+    }
+    Ok(page_size)
+}
+
+pub(crate) struct PinnedHostBuffer<T> {
+    ptr: *mut T,
+    len: usize,
+    _marker: PhantomData<T>,
+}
+
+impl<T: Copy> PinnedHostBuffer<T> {
+    pub(crate) fn try_new(len: usize) -> Result<Self> {
+        let bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| Error::io("pinned host allocation size overflow"))?;
+        let mut raw = ptr::null_mut();
+        check_cuda(
+            unsafe { cudaMallocHost(&mut raw, bytes) },
+            "allocate pinned host buffer",
+        )?;
+        Ok(Self {
+            ptr: raw.cast::<T>(),
+            len,
+            _marker: PhantomData,
+        })
+    }
+
+    pub(crate) fn as_slice(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    pub(crate) fn prefix(&self, len: usize) -> Result<&[T]> {
+        if len > self.len {
+            return Err(Error::io(format!(
+                "pinned host buffer length {} is smaller than requested prefix {}",
+                self.len, len
+            )));
+        }
+        Ok(&self.as_slice()[..len])
+    }
+
+    pub(crate) fn prefix_mut(&mut self, len: usize) -> Result<&mut [T]> {
+        if len > self.len {
+            return Err(Error::io(format!(
+                "pinned host buffer length {} is smaller than requested prefix {}",
+                self.len, len
+            )));
+        }
+        Ok(&mut self.as_mut_slice()[..len])
+    }
+}
+
+impl<T> Drop for PinnedHostBuffer<T> {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            let _ = unsafe { cudaFreeHost(self.ptr.cast::<c_void>()) };
+        }
+    }
+}
+
+/// An owned, non-blocking CUDA stream on the current device.
+pub(crate) struct CudaStream {
+    raw: cuvs_sys::cudaStream_t,
+}
+
+impl CudaStream {
+    pub(crate) fn try_new_non_blocking() -> Result<Self> {
+        let mut raw = ptr::null_mut();
+        check_cuda(
+            unsafe { cudaStreamCreateWithFlags(&mut raw, CUDA_STREAM_NON_BLOCKING) },
+            "create CUDA stream",
+        )?;
+        Ok(Self { raw })
+    }
+
+    pub(crate) fn raw(&self) -> cuvs_sys::cudaStream_t {
+        self.raw
+    }
+}
+
+impl Drop for CudaStream {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            let _ = unsafe { cudaStreamDestroy(self.raw) };
+        }
+    }
+}
+
+pub(crate) struct CudaEvent {
+    raw: CudaEventHandle,
+}
+
+impl CudaEvent {
+    pub(crate) fn try_new() -> Result<Self> {
+        let mut raw = ptr::null_mut();
+        check_cuda(unsafe { cudaEventCreate(&mut raw) }, "create CUDA event")?;
+        Ok(Self { raw })
+    }
+
+    pub(crate) fn record(&self, stream: cuvs_sys::cudaStream_t) -> Result<()> {
+        check_cuda(
+            unsafe { cudaEventRecord(self.raw, stream) },
+            "record CUDA event",
+        )
+    }
+
+    pub(crate) fn synchronize(&self) -> Result<()> {
+        check_cuda(
+            unsafe { cudaEventSynchronize(self.raw) },
+            "synchronize CUDA event",
+        )
+    }
+
+    /// Makes future work on `stream` wait until this event has completed,
+    /// without blocking the host. A no-op ordering-wise when the event was
+    /// recorded on `stream` itself.
+    pub(crate) fn make_stream_wait(&self, stream: cuvs_sys::cudaStream_t) -> Result<()> {
+        check_cuda(
+            unsafe { cudaStreamWaitEvent(stream, self.raw, 0) },
+            "make stream wait on CUDA event",
+        )
+    }
+
+    pub(crate) fn elapsed_since(&self, start: &Self) -> Result<std::time::Duration> {
+        let mut ms = 0.0f32;
+        check_cuda(
+            unsafe { cudaEventElapsedTime(&mut ms, start.raw, self.raw) },
+            "measure CUDA event elapsed time",
+        )?;
+        Ok(std::time::Duration::from_secs_f64(ms as f64 / 1000.0))
+    }
+}
+
+impl Drop for CudaEvent {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            let _ = unsafe { cudaEventDestroy(self.raw) };
+        }
+    }
+}
+
+pub(crate) fn check_cuvs(status: cuvs_sys::cuvsError_t, context: &str) -> Result<()> {
+    if status == cuvs_sys::cuvsError_t::CUVS_SUCCESS {
+        return Ok(());
+    }
+
+    let message = unsafe {
+        let text = cuvs_sys::cuvsGetLastErrorText();
+        if text.is_null() {
+            format!("{status:?}")
+        } else {
+            format!(
+                "{status:?}: {}",
+                CStr::from_ptr(text).to_string_lossy().into_owned()
+            )
+        }
+    };
+    Err(Error::io(format!("cuVS failed to {context}: {message}")))
+}
+
+pub(crate) fn check_cuda(status: CudaError, context: &str) -> Result<()> {
+    if status == CUDA_SUCCESS {
+        Ok(())
+    } else {
+        let name = unsafe { CStr::from_ptr(cudaGetErrorName(status)) };
+        Err(Error::io(format!(
+            "CUDA failed to {context}: {} ({status})",
+            name.to_string_lossy()
+        )))
+    }
+}
+
+pub(crate) fn enable_rmm_pool_from_env() -> Result<()> {
+    let Some(config) = std::env::var("LANCE_CUVS_RMM_POOL").ok() else {
+        return Ok(());
+    };
+    let (initial, max) = match config.split_once(',') {
+        Some((initial, max)) => (
+            initial.parse::<i32>().map_err(|error| {
+                Error::invalid_input(format!(
+                    "invalid LANCE_CUVS_RMM_POOL initial percent '{initial}': {error}"
+                ))
+            })?,
+            max.parse::<i32>().map_err(|error| {
+                Error::invalid_input(format!(
+                    "invalid LANCE_CUVS_RMM_POOL max percent '{max}': {error}"
+                ))
+            })?,
+        ),
+        None => {
+            let percent = config.parse::<i32>().map_err(|error| {
+                Error::invalid_input(format!(
+                    "invalid LANCE_CUVS_RMM_POOL percent '{config}': {error}"
+                ))
+            })?;
+            (percent, percent)
+        }
+    };
+    check_cuvs(
+        unsafe { cuvs_sys::cuvsRMMPoolMemoryResourceEnable(initial, max, false) },
+        "enable RMM pool memory resource",
+    )
+}
+
+pub(crate) fn cuvs_distance_type(metric_type: DistanceType) -> Result<cuvs_sys::cuvsDistanceType> {
+    match metric_type {
+        DistanceType::L2 => Ok(cuvs_sys::cuvsDistanceType::L2Expanded),
+        DistanceType::Cosine => Ok(cuvs_sys::cuvsDistanceType::CosineExpanded),
+        DistanceType::Dot => Ok(cuvs_sys::cuvsDistanceType::InnerProduct),
+        other => Err(Error::not_supported(format!(
+            "cuVS IVF_PQ does not support metric {other:?}"
+        ))),
+    }
+}
+
+pub(crate) fn create_index_params(
+    metric_type: DistanceType,
+    num_partitions: usize,
+    num_sub_vectors: usize,
+    sample_rate: usize,
+    max_iters: usize,
+    num_bits: usize,
+) -> Result<cuvs_sys::cuvsIvfPqIndexParams_t> {
+    let mut params = ptr::null_mut();
+    check_cuvs(
+        unsafe { cuvs_sys::cuvsIvfPqIndexParamsCreate(&mut params) },
+        "allocate IVF_PQ index params",
+    )?;
+    let metric = cuvs_distance_type(metric_type)?;
+    unsafe {
+        (*params).metric = metric;
+        (*params).metric_arg = 0.0;
+        (*params).add_data_on_build = false;
+        (*params).n_lists = num_partitions as u32;
+        (*params).kmeans_n_iters = max_iters as u32;
+        (*params).kmeans_trainset_fraction = 1.0;
+        (*params).pq_bits = num_bits as u32;
+        (*params).pq_dim = num_sub_vectors as u32;
+        (*params).codebook_kind =
+            cuvs_sys::cuvsIvfPqCodebookGen::CUVS_IVF_PQ_CODEBOOK_GEN_PER_SUBSPACE;
+        (*params).force_random_rotation = false;
+        (*params).conservative_memory_allocation = false;
+        (*params).max_train_points_per_pq_code = sample_rate as u32;
+        (*params).codes_layout = cuvs_sys::cuvsIvfPqListLayout::CUVS_IVF_PQ_LIST_LAYOUT_FLAT;
+    }
+    Ok(params)
+}
+
+pub(crate) fn destroy_index_params(params: cuvs_sys::cuvsIvfPqIndexParams_t) {
+    if !params.is_null() {
+        let _ = unsafe { cuvs_sys::cuvsIvfPqIndexParamsDestroy(params) };
+    }
+}
+
+pub(crate) fn make_tensor_view() -> HostTensorView {
+    let shape = Vec::new();
+    let tensor = cuvs_sys::DLManagedTensor {
+        dl_tensor: cuvs_sys::DLTensor {
+            data: ptr::null_mut(),
+            device: cuvs_sys::DLDevice {
+                device_type: cuvs_sys::DLDeviceType::kDLCPU,
+                device_id: 0,
+            },
+            ndim: 0,
+            dtype: <f32 as DlElement>::dl_dtype(),
+            shape: shape.as_ptr() as *mut i64,
+            strides: ptr::null_mut(),
+            byte_offset: 0,
+        },
+        manager_ctx: ptr::null_mut(),
+        deleter: None,
+    };
+    HostTensorView { shape, tensor }
+}
+
+pub(crate) fn tensor_shape(tensor: &cuvs_sys::DLManagedTensor) -> Vec<usize> {
+    let dl_tensor = &tensor.dl_tensor;
+    (0..dl_tensor.ndim)
+        .map(|idx| unsafe { *dl_tensor.shape.add(idx as usize) as usize })
+        .collect()
+}
+
+pub(crate) fn tensor_num_bytes(tensor: &cuvs_sys::DLManagedTensor) -> usize {
+    let shape = tensor_shape(tensor);
+    let numel = shape.into_iter().product::<usize>();
+    numel * ((tensor.dl_tensor.dtype.bits as usize) / 8)
+}
+
+pub(crate) fn copy_tensor_to_host_f32_2d(
+    resources: &Resources,
+    tensor: &cuvs_sys::DLManagedTensor,
+) -> Result<Array2<f32>> {
+    let shape = tensor_shape(tensor);
+    if shape.len() != 2 {
+        return Err(Error::io(format!(
+            "expected 2D tensor, got shape {shape:?}"
+        )));
+    }
+    let mut array = Array2::<f32>::zeros((shape[0], shape[1]));
+    let stream = resources
+        .get_cuda_stream()
+        .map_err(|e| Error::io(e.to_string()))?;
+    if tensor.dl_tensor.strides.is_null() {
+        check_cuda(
+            unsafe {
+                cudaMemcpyAsync(
+                    array.as_mut_ptr() as *mut _,
+                    tensor.dl_tensor.data,
+                    tensor_num_bytes(tensor),
+                    CUDA_MEMCPY_DEFAULT,
+                    stream,
+                )
+            },
+            "copy tensor to host",
+        )?;
+    } else {
+        let row_stride = unsafe { *tensor.dl_tensor.strides } as usize;
+        let col_stride = unsafe { *tensor.dl_tensor.strides.add(1) } as usize;
+        if col_stride != 1 {
+            return Err(Error::not_supported(format!(
+                "copying 2D tensors with non-unit column stride is not supported: strides=({}, {})",
+                row_stride, col_stride
+            )));
+        }
+        let row_bytes = shape[1] * std::mem::size_of::<f32>();
+        check_cuda(
+            unsafe {
+                cudaMemcpy2DAsync(
+                    array.as_mut_ptr().cast::<c_void>(),
+                    row_bytes,
+                    tensor.dl_tensor.data,
+                    row_stride * std::mem::size_of::<f32>(),
+                    row_bytes,
+                    shape[0],
+                    CUDA_MEMCPY_DEFAULT,
+                    stream,
+                )
+            },
+            "copy strided tensor to host",
+        )?;
+    }
+    resources
+        .sync_stream()
+        .map_err(|e| Error::io(e.to_string()))?;
+    Ok(array)
+}
+
+pub(crate) fn copy_tensor_to_host_f32_3d(
+    resources: &Resources,
+    tensor: &cuvs_sys::DLManagedTensor,
+) -> Result<(Vec<f32>, [usize; 3])> {
+    let shape = tensor_shape(tensor);
+    if shape.len() != 3 {
+        return Err(Error::io(format!(
+            "expected 3D tensor, got shape {shape:?}"
+        )));
+    }
+    let mut values = vec![0.0f32; shape.iter().product()];
+    check_cuda(
+        unsafe {
+            cudaMemcpyAsync(
+                values.as_mut_ptr() as *mut _,
+                tensor.dl_tensor.data,
+                tensor_num_bytes(tensor),
+                CUDA_MEMCPY_DEFAULT,
+                resources
+                    .get_cuda_stream()
+                    .map_err(|e| Error::io(e.to_string()))?,
+            )
+        },
+        "copy tensor to host",
+    )?;
+    resources
+        .sync_stream()
+        .map_err(|e| Error::io(e.to_string()))?;
+    Ok((values, [shape[0], shape[1], shape[2]]))
+}
+
+pub(crate) fn matrix_from_vectors<'a>(vectors: &'a FixedSizeListArray) -> Result<MatrixBuffer<'a>> {
+    let dim = vectors.value_length() as usize;
+    match vectors.value_type() {
+        DataType::Float32 => {
+            let values = vectors.values().as_primitive::<Float32Type>();
+            let values: &[f32] = values.values().as_ref();
+            Ok(MatrixBuffer::Borrowed {
+                values,
+                rows: vectors.len(),
+                cols: dim,
+            })
+        }
+        DataType::Float16 => {
+            let values = vectors.values().as_primitive::<Float16Type>();
+            let data = values
+                .values()
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>();
+            Ok(MatrixBuffer::Owned(
+                Array2::from_shape_vec((vectors.len(), dim), data).map_err(|error| {
+                    Error::io(format!("failed to create float16 matrix copy: {error}"))
+                })?,
+            ))
+        }
+        DataType::Float64 => {
+            let values = vectors.values().as_primitive::<Float64Type>();
+            let data = values
+                .values()
+                .iter()
+                .map(|value| *value as f32)
+                .collect::<Vec<_>>();
+            Ok(MatrixBuffer::Owned(
+                Array2::from_shape_vec((vectors.len(), dim), data).map_err(|error| {
+                    Error::io(format!("failed to create float64 matrix copy: {error}"))
+                })?,
+            ))
+        }
+        other => Err(Error::not_supported(format!(
+            "cuVS IVF_PQ currently supports float16/float32/float64 vectors, got {other}"
+        ))),
+    }
+}
+
+pub(crate) fn ivf_centroids_from_host(array: Array2<f32>) -> Result<FixedSizeListArray> {
+    let dim = array.ncols() as i32;
+    let values = arrow_array::Float32Array::from_iter_values(array);
+    Ok(FixedSizeListArray::try_new_from_values(values, dim)?)
+}
+
+pub(crate) fn pq_codebook_from_host(
+    values: Vec<f32>,
+    shape: [usize; 3],
+    num_sub_vectors: usize,
+    dimension: usize,
+    num_bits: usize,
+) -> Result<FixedSizeListArray> {
+    let pq_book_size = 1usize << num_bits;
+    let subvector_dim = dimension / num_sub_vectors;
+    let expected = [num_sub_vectors, subvector_dim, pq_book_size];
+    if shape != expected {
+        return Err(Error::io(format!(
+            "cuVS returned incompatible PQ codebook shape: expected {expected:?}, got {shape:?}"
+        )));
+    }
+
+    let mut flattened = Vec::with_capacity(values.len());
+    for subspace in 0..num_sub_vectors {
+        for centroid in 0..pq_book_size {
+            for component in 0..subvector_dim {
+                let source_idx = ((subspace * subvector_dim + component) * pq_book_size) + centroid;
+                flattened.push(values[source_idx]);
+            }
+        }
+    }
+
+    Ok(FixedSizeListArray::try_new_from_values(
+        arrow_array::Float32Array::from(flattened),
+        subvector_dim as i32,
+    )?)
+}
