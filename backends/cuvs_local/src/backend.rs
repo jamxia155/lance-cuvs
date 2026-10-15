@@ -1268,8 +1268,17 @@ fn prepare_transform_batch(
             stats.register += register_start.elapsed();
             stats.registered_bytes += registration
                 .as_ref()
-                .map(RegisteredHostBuffer::original_bytes)
+                .map(RegisteredHostBuffer::registered_bytes)
                 .unwrap_or_default();
+            // The registration covers only the whole pages inside the
+            // buffer; copy the pageable head and tail separately.
+            if let Some(segments) = registration
+                .as_ref()
+                .map(RegisteredHostBuffer::segments)
+                .filter(|segments| segments.len() > 1)
+            {
+                copy_segments = Some(segments);
+            }
             (
                 PreparedMatrix::F32Arrow {
                     vectors: filtered_vectors,

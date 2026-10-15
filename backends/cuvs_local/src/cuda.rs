@@ -440,6 +440,9 @@ impl<T: DlElement> Drop for DeviceTensor<T> {
 pub(crate) struct RegisteredHostBuffer {
     ptr: *mut c_void,
     original_bytes: usize,
+    /// Registered byte range, relative to the buffer's start. Empty when the
+    /// buffer contains no whole page.
+    registered: std::ops::Range<usize>,
 }
 
 // CUDA host registration owns a process-local address range; unregistering it
@@ -447,13 +450,27 @@ pub(crate) struct RegisteredHostBuffer {
 unsafe impl Send for RegisteredHostBuffer {}
 
 impl RegisteredHostBuffer {
+    /// Registers the whole pages inside `slice`.
+    ///
+    /// Rounds inward (ceil the start, floor the end), not outward:
+    /// consecutive batches are often contiguous, non-page-aligned slices of
+    /// one Arrow buffer, and several batches' registrations are alive at
+    /// once. Outward rounding made neighbours' ranges share a page, so the
+    /// second `cudaHostRegister` failed with
+    /// `cudaErrorHostMemoryAlreadyRegistered` and its pageable fallback copy,
+    /// which then started inside the neighbour's registration and ran past
+    /// its end, failed with `cudaErrorInvalidValue`. Inward ranges of
+    /// disjoint slices never overlap; the partial pages at either end stay
+    /// pageable, so copy the buffer in [`Self::segments`].
     pub(crate) fn try_new<T>(slice: &[T]) -> Result<Self> {
         let original_bytes = std::mem::size_of_val(slice);
+        let unregistered = |original_bytes| Self {
+            ptr: ptr::null_mut(),
+            original_bytes,
+            registered: 0..0,
+        };
         if original_bytes == 0 {
-            return Ok(Self {
-                ptr: ptr::null_mut(),
-                original_bytes: 0,
-            });
+            return Ok(unregistered(0));
         }
 
         let page_size = page_size()?;
@@ -461,26 +478,47 @@ impl RegisteredHostBuffer {
         let end = start
             .checked_add(original_bytes)
             .ok_or_else(|| Error::io("registered host buffer size overflow"))?;
-        let aligned_start = start & !(page_size - 1);
-        let aligned_end = end
+        let inward_start = start
             .checked_add(page_size - 1)
             .ok_or_else(|| Error::io("registered host buffer alignment overflow"))?
             & !(page_size - 1);
-        let bytes = aligned_end - aligned_start;
-        let ptr = aligned_start as *mut c_void;
+        let inward_end = end & !(page_size - 1);
+        if inward_end <= inward_start {
+            return Ok(unregistered(original_bytes));
+        }
+        let ptr = inward_start as *mut c_void;
 
         check_cuda(
-            unsafe { cudaHostRegister(ptr, bytes, 0) },
+            unsafe { cudaHostRegister(ptr, inward_end - inward_start, 0) },
             "register host buffer",
         )?;
         Ok(Self {
             ptr,
             original_bytes,
+            registered: inward_start - start..inward_end - start,
         })
     }
 
-    pub(crate) fn original_bytes(&self) -> usize {
-        self.original_bytes
+    pub(crate) fn registered_bytes(&self) -> usize {
+        self.registered.len()
+    }
+
+    /// Byte ranges relative to the buffer's start, tiling it in order: the
+    /// pageable head, the registered middle and the pageable tail, skipping
+    /// empty ones. Each lies entirely inside or entirely outside the
+    /// registration, so one H2D copy per segment is valid.
+    pub(crate) fn segments(&self) -> Vec<std::ops::Range<usize>> {
+        if self.registered.is_empty() {
+            return vec![0..self.original_bytes];
+        }
+        [
+            0..self.registered.start,
+            self.registered.clone(),
+            self.registered.end..self.original_bytes,
+        ]
+        .into_iter()
+        .filter(|segment| !segment.is_empty())
+        .collect()
     }
 }
 
