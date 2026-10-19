@@ -279,11 +279,11 @@ pub fn run() -> BenchResult<()> {
             unsafe { cuvs_sys::cuvsCagraIndexCreate(&mut index) },
             "create CAGRA index",
         ))?;
-        // Non-owning view: `centroid_dev` must outlive the index.
+        // Non-owning padded view (search rejects a standard one): `centroid_dev` must outlive the index.
         let mut dataset = ptr::null_mut();
         err(check_cuvs(
             unsafe {
-                cuvs_sys::cuvsDatasetMakeStandardView(res.0, centroid_dev.as_mut_ptr(), &mut dataset)
+                cuvs_sys::cuvsDatasetMakePaddedView(res.0, centroid_dev.as_mut_ptr(), &mut dataset)
             },
             "wrap centroids as a CAGRA dataset view",
         ))?;
