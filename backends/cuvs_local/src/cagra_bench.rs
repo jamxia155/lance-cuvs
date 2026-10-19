@@ -279,9 +279,17 @@ pub fn run() -> BenchResult<()> {
             unsafe { cuvs_sys::cuvsCagraIndexCreate(&mut index) },
             "create CAGRA index",
         ))?;
+        // Non-owning view: `centroid_dev` must outlive the index.
+        let mut dataset = ptr::null_mut();
+        err(check_cuvs(
+            unsafe {
+                cuvs_sys::cuvsDatasetMakeStandardView(res.0, centroid_dev.as_mut_ptr(), &mut dataset)
+            },
+            "wrap centroids as a CAGRA dataset view",
+        ))?;
         let build_start = Instant::now();
         let build = check_cuvs(
-            unsafe { cuvs_sys::cuvsCagraBuild(res.0, params, centroid_dev.as_mut_ptr(), index) },
+            unsafe { cuvs_sys::cuvsCagraBuild(res.0, params, dataset, index) },
             "build CAGRA index",
         );
         let _ = unsafe { cuvs_sys::cuvsCagraIndexParamsDestroy(params) };
@@ -370,6 +378,7 @@ pub fn run() -> BenchResult<()> {
             }
         }
         let _ = unsafe { cuvs_sys::cuvsCagraIndexDestroy(index) };
+        let _ = unsafe { cuvs_sys::cuvsDatasetDestroy(dataset) };
     }
     let _ = unsafe { cuvs_sys::cuvsBruteForceIndexDestroy(bf_index) };
     Ok(())
