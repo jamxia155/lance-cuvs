@@ -247,6 +247,20 @@ impl DlElement for i64 {
     }
 }
 
+/// A second shape over a [`DeviceTensor`]'s memory, e.g. `[rows, 1]` for a `[rows]` vector.
+/// Borrows nothing: it must not outlive the tensor it was made from.
+pub(crate) struct DeviceTensorView {
+    shape: Vec<i64>,
+    tensor: cuvs_sys::DLManagedTensor,
+}
+
+impl DeviceTensorView {
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut cuvs_sys::DLManagedTensor {
+        self.tensor.dl_tensor.shape = self.shape.as_mut_ptr();
+        &mut self.tensor
+    }
+}
+
 pub(crate) struct DeviceTensor<T: DlElement> {
     shape: Vec<i64>,
     tensor: cuvs_sys::DLManagedTensor,
@@ -298,6 +312,33 @@ impl<T: DlElement> DeviceTensor<T> {
     pub(crate) fn as_mut_ptr(&mut self) -> *mut cuvs_sys::DLManagedTensor {
         debug_assert_eq!(self.shape.len(), self.tensor.dl_tensor.ndim as usize);
         &mut self.tensor
+    }
+
+    /// Views the buffer as `shape`, which must not exceed its capacity.
+    pub(crate) fn view_with_shape(&self, shape: &[usize]) -> Result<DeviceTensorView> {
+        let required_bytes = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        if required_bytes > self.capacity_bytes {
+            return Err(Error::io(format!(
+                "device tensor capacity {} bytes is smaller than requested view {:?} ({} bytes)",
+                self.capacity_bytes, shape, required_bytes
+            )));
+        }
+        let shape = shape.iter().map(|dim| *dim as i64).collect::<Vec<_>>();
+        let mut tensor = cuvs_sys::DLManagedTensor {
+            dl_tensor: cuvs_sys::DLTensor {
+                data: self.tensor.dl_tensor.data,
+                device: self.tensor.dl_tensor.device,
+                ndim: shape.len() as i32,
+                dtype: T::dl_dtype(),
+                shape: ptr::null_mut(),
+                strides: ptr::null_mut(),
+                byte_offset: 0,
+            },
+            manager_ctx: ptr::null_mut(),
+            deleter: None,
+        };
+        tensor.dl_tensor.shape = shape.as_ptr() as *mut i64;
+        Ok(DeviceTensorView { shape, tensor })
     }
 
     pub(crate) fn set_shape(&mut self, shape: &[usize]) -> Result<()> {

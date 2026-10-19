@@ -7,6 +7,7 @@ use crate::cuda::{
     create_index_params, destroy_index_params, enable_rmm_pool_from_env, ivf_centroids_from_host,
     jemalloc_never_releases_memory, make_tensor_view, matrix_from_vectors, pq_codebook_from_host,
 };
+use crate::cagra_assign::{CagraAssignConfig, CagraAssigner};
 use arrow::compute::filter;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float32Type;
@@ -67,6 +68,9 @@ pub struct TrainedIvfPqIndex {
     pub(crate) metric_type: DistanceType,
     pub(crate) ivf_centroids: FixedSizeListArray,
     pub(crate) pq_codebook: FixedSizeListArray,
+    /// Graph over the IVF centroids that replaces the exhaustive coarse
+    /// assignment in the transform (`LANCE_CUVS_ASSIGN=cagra`).
+    pub(crate) cagra: Option<CagraAssigner>,
 }
 
 impl TrainedIvfPqIndex {
@@ -347,6 +351,8 @@ struct TransformSlot {
     input_device: DeviceTensor<f32>,
     labels_host: PinnedHostBuffer<u32>,
     labels_device: DeviceTensor<u32>,
+    // Top-1 distances from the CAGRA assignment; unused otherwise.
+    distances_device: Option<DeviceTensor<f32>>,
     codes_host: PinnedHostBuffer<u8>,
     codes_device: DeviceTensor<u8>,
     h2d_start: CudaEvent,
@@ -435,6 +441,8 @@ struct DrainedTransformBatch {
 struct LaunchTimings {
     h2d_enqueue: Duration,
     transform_call: Duration,
+    /// CAGRA assignment search, included in `transform_call`.
+    assign_call: Duration,
     d2h_enqueue: Duration,
 }
 
@@ -470,11 +478,17 @@ impl TransformSlot {
         max_rows: usize,
         dimension: usize,
         code_width: usize,
+        with_distances: bool,
     ) -> Result<Self> {
         Ok(Self {
             input_device: DeviceTensor::try_new(resources, &[max_rows, dimension])?,
             labels_host: PinnedHostBuffer::try_new(max_rows)?,
             labels_device: DeviceTensor::try_new(resources, &[max_rows])?,
+            distances_device: if with_distances {
+                Some(DeviceTensor::try_new(resources, &[max_rows, 1])?)
+            } else {
+                None
+            },
             codes_host: PinnedHostBuffer::try_new(max_rows * code_width)?,
             codes_device: DeviceTensor::try_new(resources, &[max_rows, code_width])?,
             h2d_start: CudaEvent::try_new()?,
@@ -527,6 +541,9 @@ impl TransformSlot {
 
         self.input_device.set_shape(&[rows, dimension])?;
         self.labels_device.set_shape(&[rows])?;
+        if let Some(distances) = self.distances_device.as_mut() {
+            distances.set_shape(&[rows, 1])?;
+        }
         self.codes_device.set_shape(&[rows, code_width])?;
         self.rows = rows;
         self.row_ids = Some(row_ids);
@@ -579,18 +596,46 @@ impl TransformSlot {
         self.h2d_done.make_stream_wait(stream)?;
         self.transform_start.record(stream)?;
         let transform_call_start = Instant::now();
-        check_cuvs(
-            unsafe {
-                cuvs_sys::cuvsIvfPqTransform(
-                    trained.resources.0,
-                    trained.index.raw,
+        match (&trained.cagra, self.distances_device.as_mut()) {
+            (Some(cagra), Some(distances)) => {
+                // Coarse assignment by graph search straight into `labels_device`
+                // (as a `[rows, 1]` view), then residual + PQ encode against those
+                // labels.
+                let assign_start = Instant::now();
+                let mut labels_2d = self.labels_device.view_with_shape(&[rows, 1])?;
+                cagra.assign(
+                    &trained.resources,
                     self.input_device.as_mut_ptr(),
-                    self.labels_device.as_mut_ptr(),
-                    self.codes_device.as_mut_ptr(),
-                )
-            },
-            "transform vectors with IVF_PQ",
-        )?;
+                    &mut labels_2d,
+                    distances.as_mut_ptr(),
+                )?;
+                timings.assign_call += assign_start.elapsed();
+                check_cuvs(
+                    unsafe {
+                        cuvs_sys::cuvsIvfPqTransformWithLabels(
+                            trained.resources.0,
+                            trained.index.raw,
+                            self.input_device.as_mut_ptr(),
+                            self.labels_device.as_mut_ptr(),
+                            self.codes_device.as_mut_ptr(),
+                        )
+                    },
+                    "encode vectors with IVF_PQ against CAGRA labels",
+                )?;
+            }
+            _ => check_cuvs(
+                unsafe {
+                    cuvs_sys::cuvsIvfPqTransform(
+                        trained.resources.0,
+                        trained.index.raw,
+                        self.input_device.as_mut_ptr(),
+                        self.labels_device.as_mut_ptr(),
+                        self.codes_device.as_mut_ptr(),
+                    )
+                },
+                "transform vectors with IVF_PQ",
+            )?,
+        }
         timings.transform_call += transform_call_start.elapsed();
         self.transform_done.record(stream)?;
         let d2h_enqueue_start = Instant::now();
@@ -668,6 +713,7 @@ struct ArtifactBuildStats {
     gpu_d2h: Duration,
     launch_h2d_enqueue: Duration,
     launch_transform_call: Duration,
+    launch_assign_call: Duration,
     launch_d2h_enqueue: Duration,
     drain_sync: Duration,
     drain_build_batch: Duration,
@@ -740,6 +786,7 @@ impl ArtifactBuildStats {
     fn record_launch_timings(&mut self, timings: LaunchTimings) {
         self.launch_h2d_enqueue += timings.h2d_enqueue;
         self.launch_transform_call += timings.transform_call;
+        self.launch_assign_call += timings.assign_call;
         self.launch_d2h_enqueue += timings.d2h_enqueue;
     }
 
@@ -791,9 +838,10 @@ impl ArtifactBuildStats {
             secs(self.gpu_d2h),
         );
         eprintln!(
-            "cuVS artifact launch cpu: h2d_enqueue_s={:.3} transform_call_s={:.3} d2h_enqueue_s={:.3}",
+            "cuVS artifact launch cpu: h2d_enqueue_s={:.3} transform_call_s={:.3} (cagra_assign_s={:.3}) d2h_enqueue_s={:.3}",
             secs(self.launch_h2d_enqueue),
             secs(self.launch_transform_call),
+            secs(self.launch_assign_call),
             secs(self.launch_d2h_enqueue),
         );
         eprintln!(
@@ -1397,6 +1445,7 @@ async fn append_transformed_batches_to_artifact(
                 batch_size,
                 trained.dimension,
                 code_width,
+                trained.cagra.is_some(),
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1900,6 +1949,16 @@ pub async fn train_ivf_pq(
         build_time.as_secs_f64()
     );
 
+    let cagra = match CagraAssignConfig::from_env()? {
+        Some(config) => Some(CagraAssigner::build(
+            &resources,
+            &ivf_centroids,
+            metric_type,
+            &config,
+        )?),
+        None => None,
+    };
+
     Ok(TrainedIvfPqIndex {
         resources,
         index,
@@ -1910,6 +1969,7 @@ pub async fn train_ivf_pq(
         metric_type,
         ivf_centroids,
         pq_codebook,
+        cagra,
     })
 }
 
