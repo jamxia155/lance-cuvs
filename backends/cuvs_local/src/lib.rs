@@ -12,6 +12,8 @@
 //! to Lance's own index creation APIs.
 
 mod backend;
+#[doc(hidden)]
+pub mod cagra_bench;
 mod cuda;
 #[cfg(feature = "python")]
 mod python;

@@ -237,6 +237,16 @@ impl DlElement for u32 {
     }
 }
 
+impl DlElement for i64 {
+    fn dl_dtype() -> cuvs_sys::DLDataType {
+        cuvs_sys::DLDataType {
+            code: cuvs_sys::DLDataTypeCode::kDLInt as u8,
+            bits: 64,
+            lanes: 1,
+        }
+    }
+}
+
 pub(crate) struct DeviceTensor<T: DlElement> {
     shape: Vec<i64>,
     tensor: cuvs_sys::DLManagedTensor,
