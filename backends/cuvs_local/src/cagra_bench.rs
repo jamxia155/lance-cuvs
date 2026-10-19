@@ -34,6 +34,8 @@ struct Args {
     num_queries: Option<usize>,
     batches: Vec<usize>,
     itopk: Vec<usize>,
+    /// 0 lets cuVS resolve it (itopk / search_width + graph hops).
+    max_iterations: Vec<usize>,
     graph_degrees: Vec<usize>,
     /// (M, ef_construction, heuristic): derive CAGRA build params with cuVS's
     /// `cuvsCagraIndexParamsFromHnswParams` instead of `--graph-degree`.
@@ -63,6 +65,7 @@ fn parse_args() -> BenchResult<Args> {
         num_queries: None,
         batches: vec![128 * 1024],
         itopk: vec![32, 64, 128],
+        max_iterations: vec![0],
         graph_degrees: vec![32],
         hnsw: None,
         max_queries: 0,
@@ -81,6 +84,7 @@ fn parse_args() -> BenchResult<Args> {
             }
             "--batch" => args.batches = parse_list(&value()?)?,
             "--itopk" => args.itopk = parse_list(&value()?)?,
+            "--max-iterations" => args.max_iterations = parse_list(&value()?)?,
             "--graph-degree" => args.graph_degrees = parse_list(&value()?)?,
             "--hnsw" => {
                 let v = value()?;
@@ -344,7 +348,11 @@ pub fn run() -> BenchResult<()> {
             let batch = batch.min(n);
             let mut buf = SearchBuffers::<u32>::new(&res, batch, dim)?;
             let batches = Batches { queries: &queries, dim, batch };
-            for &itopk in &args.itopk {
+            for (&itopk, &max_iterations) in args
+                .itopk
+                .iter()
+                .flat_map(|i| args.max_iterations.iter().map(move |m| (i, m)))
+            {
                 let mut sp = ptr::null_mut();
                 err(check_cuvs(
                     unsafe { cuvs_sys::cuvsCagraSearchParamsCreate(&mut sp) },
@@ -352,6 +360,7 @@ pub fn run() -> BenchResult<()> {
                 ))?;
                 unsafe {
                     (*sp).itopk_size = itopk;
+                    (*sp).max_iterations = max_iterations;
                     (*sp).max_queries = args.max_queries;
                     (*sp).algo = match args.algo.as_str() {
                         "auto" => cuvs_sys::cuvsCagraSearchAlgo::AUTO,
@@ -405,7 +414,7 @@ pub fn run() -> BenchResult<()> {
                 }
                 let _ = unsafe { cuvs_sys::cuvsCagraSearchParamsDestroy(sp) };
                 println!(
-                    "cagra search: graph_degree={graph_degree} batch={batch} itopk={itopk} \
+                    "cagra search: graph_degree={graph_degree} batch={batch} itopk={itopk} max_iterations={max_iterations} \
                      algo={} max_queries={} timed_rows={timed_rows} search_s={search_s:.3} \
                      rows_per_s={:.0} label_agree={:.5} agree_or_tie={:.5}",
                     args.algo,

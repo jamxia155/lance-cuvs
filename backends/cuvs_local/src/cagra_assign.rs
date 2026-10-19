@@ -15,6 +15,7 @@
 //! - `LANCE_CUVS_CAGRA_INTERMEDIATE_DEGREE` (default 2 x graph degree)
 //! - `LANCE_CUVS_CAGRA_ITOPK` (default 32; larger is slower and closer to exact)
 //! - `LANCE_CUVS_CAGRA_MAX_QUERIES` (default 0: cuVS decides)
+//! - `LANCE_CUVS_CAGRA_MAX_ITERATIONS` (default 0: cuVS decides; lower is faster, less exact)
 
 use crate::cuda::{DeviceTensor, DeviceTensorView, Resources, check_cuvs};
 use arrow_array::{Array, FixedSizeListArray};
@@ -34,6 +35,9 @@ pub(crate) struct CagraAssignConfig {
     pub(crate) intermediate_graph_degree: usize,
     pub(crate) itopk_size: usize,
     pub(crate) max_queries: usize,
+    /// 0 lets cuVS resolve it: `itopk / search_width` plus one per graph hop level
+    /// (36 for 32768 centroids at degree 32, itopk 32). Lower is faster and less exact.
+    pub(crate) max_iterations: usize,
 }
 
 fn usize_from_env(name: &str) -> Result<Option<usize>> {
@@ -67,6 +71,7 @@ impl CagraAssignConfig {
                 .unwrap_or(graph_degree * 2),
             itopk_size: usize_from_env("LANCE_CUVS_CAGRA_ITOPK")?.unwrap_or(DEFAULT_ITOPK),
             max_queries: usize_from_env("LANCE_CUVS_CAGRA_MAX_QUERIES")?.unwrap_or(0),
+            max_iterations: usize_from_env("LANCE_CUVS_CAGRA_MAX_ITERATIONS")?.unwrap_or(0),
         }))
     }
 }
@@ -77,6 +82,8 @@ pub(crate) struct CagraAssigner {
     // The index keeps a non-owning view of this dataset: it must outlive it.
     dataset: cuvs_sys::cuvsDataset_t,
     search_params: cuvs_sys::cuvsCagraSearchParams_t,
+    // Backs `dataset` when it is a view; declared last so it drops last.
+    _centers: DeviceTensor<f32>,
 }
 
 // SAFETY: the graph and search parameters are immutable after `build`;
@@ -118,20 +125,30 @@ impl CagraAssigner {
         centers.copy_from_host_async_on(stream, values)?;
         resources.sync_stream()?;
 
-        // An owning, padded copy: `centers` can be dropped after the build and
-        // the layout is valid for any `dim`.
+        // cuVS wants a padded dataset. A device tensor whose rows already have the
+        // padded stride can only be viewed (`centers` then stays alive with the
+        // index); any other layout is copied into padded storage.
         let mut dataset = ptr::null_mut();
-        check_cuvs(
+        let viewed = check_cuvs(
             unsafe {
-                cuvs_sys::cuvsDatasetMakePadded(
-                    resources.0,
-                    centers.as_mut_ptr(),
-                    cuvs_sys::cuvsDatasetMemType_t::CUVS_DATASET_MEM_TYPE_DEVICE,
-                    &mut dataset,
-                )
+                cuvs_sys::cuvsDatasetMakePaddedView(resources.0, centers.as_mut_ptr(), &mut dataset)
             },
-            "create CAGRA centroid dataset",
-        )?;
+            "view centroids as a CAGRA dataset",
+        );
+        if viewed.is_err() {
+            dataset = ptr::null_mut();
+            check_cuvs(
+                unsafe {
+                    cuvs_sys::cuvsDatasetMakePadded(
+                        resources.0,
+                        centers.as_mut_ptr(),
+                        cuvs_sys::cuvsDatasetMemType_t::CUVS_DATASET_MEM_TYPE_DEVICE,
+                        &mut dataset,
+                    )
+                },
+                "create CAGRA centroid dataset",
+            )?;
+        }
 
         let mut params = ptr::null_mut();
         check_cuvs(
@@ -165,18 +182,20 @@ impl CagraAssigner {
             )
         });
         // From here `Self` owns the handles, so any error below drops them.
-        let assigner = Self { index, dataset, search_params };
+        let assigner = Self { index, dataset, search_params, _centers: centers };
         searchable?;
         unsafe {
             (*search_params).itopk_size = config.itopk_size;
             (*search_params).max_queries = config.max_queries;
+            (*search_params).max_iterations = config.max_iterations;
         }
         eprintln!(
             "cuVS CAGRA assignment: graph over {n_lists} x {dim} centroids, graph_degree={} \
-             intermediate_graph_degree={} itopk={} max_queries={} build_s={:.3}",
+             intermediate_graph_degree={} itopk={} max_iterations={} max_queries={} build_s={:.3}",
             config.graph_degree,
             config.intermediate_graph_degree,
             config.itopk_size,
+            config.max_iterations,
             config.max_queries,
             start.elapsed().as_secs_f64()
         );
