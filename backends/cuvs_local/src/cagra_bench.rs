@@ -35,6 +35,9 @@ struct Args {
     batches: Vec<usize>,
     itopk: Vec<usize>,
     graph_degrees: Vec<usize>,
+    /// (M, ef_construction, heuristic): derive CAGRA build params with cuVS's
+    /// `cuvsCagraIndexParamsFromHnswParams` instead of `--graph-degree`.
+    hnsw: Option<(i32, i32, String)>,
     /// 0 lets cuVS choose.
     max_queries: usize,
     /// "auto", "single_cta", "multi_cta" or "multi_kernel".
@@ -61,6 +64,7 @@ fn parse_args() -> BenchResult<Args> {
         batches: vec![128 * 1024],
         itopk: vec![32, 64, 128],
         graph_degrees: vec![32],
+        hnsw: None,
         max_queries: 0,
         algo: "auto".to_string(),
         warmup_batches: 1,
@@ -78,6 +82,16 @@ fn parse_args() -> BenchResult<Args> {
             "--batch" => args.batches = parse_list(&value()?)?,
             "--itopk" => args.itopk = parse_list(&value()?)?,
             "--graph-degree" => args.graph_degrees = parse_list(&value()?)?,
+            "--hnsw" => {
+                let v = value()?;
+                let parts = v.split(',').collect::<Vec<_>>();
+                if parts.len() != 3 {
+                    return Err("--hnsw takes M,ef_construction,similar|footprint".to_string());
+                }
+                let m = parts[0].parse::<i32>().map_err(|e| e.to_string())?;
+                let ef = parts[1].parse::<i32>().map_err(|e| e.to_string())?;
+                args.hnsw = Some((m, ef, parts[2].to_string()));
+            }
             "--max-queries" => {
                 args.max_queries = value()?.parse::<usize>().map_err(|e| e.to_string())?
             }
@@ -263,17 +277,42 @@ pub fn run() -> BenchResult<()> {
          (first batch excluded when there are several)"
     );
 
-    for &graph_degree in &args.graph_degrees {
+    let degrees = if args.hnsw.is_some() { vec![0] } else { args.graph_degrees.clone() };
+    for &graph_degree in &degrees {
         let mut params = ptr::null_mut();
         err(check_cuvs(
             unsafe { cuvs_sys::cuvsCagraIndexParamsCreate(&mut params) },
             "create CAGRA index params",
         ))?;
-        unsafe {
-            (*params).metric = cuvs_sys::cuvsDistanceType::L2Expanded;
-            (*params).graph_degree = graph_degree;
-            (*params).intermediate_graph_degree = graph_degree * 2;
+        if let Some((m, ef, heuristic)) = &args.hnsw {
+            let heuristic = match heuristic.as_str() {
+                "similar" => cuvs_sys::cuvsCagraHnswHeuristicType::CUVS_CAGRA_HEURISTIC_SIMILAR_SEARCH_PERFORMANCE,
+                "footprint" => cuvs_sys::cuvsCagraHnswHeuristicType::CUVS_CAGRA_HEURISTIC_SAME_GRAPH_FOOTPRINT,
+                other => return Err(format!("unknown HNSW heuristic {other}")),
+            };
+            err(check_cuvs(
+                unsafe {
+                    cuvs_sys::cuvsCagraIndexParamsFromHnswParams(
+                        params,
+                        k as i64,
+                        dim as i64,
+                        *m,
+                        *ef,
+                        heuristic,
+                        cuvs_sys::cuvsDistanceType::L2Expanded,
+                    )
+                },
+                "derive CAGRA params from HNSW params",
+            ))?;
+        } else {
+            unsafe {
+                (*params).metric = cuvs_sys::cuvsDistanceType::L2Expanded;
+                (*params).graph_degree = graph_degree;
+                (*params).intermediate_graph_degree = graph_degree * 2;
+            }
         }
+        let (graph_degree, intermediate) =
+            unsafe { ((*params).graph_degree, (*params).intermediate_graph_degree) };
         let mut index = ptr::null_mut();
         err(check_cuvs(
             unsafe { cuvs_sys::cuvsCagraIndexCreate(&mut index) },
@@ -296,8 +335,8 @@ pub fn run() -> BenchResult<()> {
         err(build)?;
         err(res.sync_stream())?;
         println!(
-            "cagra build: graph_degree={graph_degree} intermediate={} build_s={:.3}",
-            graph_degree * 2,
+            "cagra build: graph_degree={graph_degree} intermediate={intermediate} hnsw={:?} build_s={:.3}",
+            args.hnsw,
             build_start.elapsed().as_secs_f64()
         );
 
