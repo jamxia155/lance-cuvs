@@ -247,6 +247,37 @@ impl DlElement for i64 {
     }
 }
 
+/// Narrows `rows` i64 ids in `src` to u32 in `dst`, on `stream`. The ids here are row
+/// numbers below 2^32, so the low word of each little-endian i64 is the value: a
+/// 4-byte-wide strided 2D copy does it without a kernel.
+pub(crate) fn narrow_i64_to_u32_async(
+    stream: cuvs_sys::cudaStream_t,
+    src: &DeviceTensor<i64>,
+    dst: &mut DeviceTensor<u32>,
+    rows: usize,
+) -> Result<()> {
+    if rows * std::mem::size_of::<i64>() > src.capacity_bytes
+        || rows * std::mem::size_of::<u32>() > dst.capacity_bytes
+    {
+        return Err(Error::io(format!("narrowing {rows} ids exceeds a device tensor capacity")));
+    }
+    check_cuda(
+        unsafe {
+            cudaMemcpy2DAsync(
+                dst.tensor.dl_tensor.data,
+                std::mem::size_of::<u32>(),
+                src.tensor.dl_tensor.data,
+                std::mem::size_of::<i64>(),
+                std::mem::size_of::<u32>(),
+                rows,
+                CUDA_MEMCPY_DEFAULT,
+                stream,
+            )
+        },
+        "narrow i64 ids to u32",
+    )
+}
+
 /// A second shape over a [`DeviceTensor`]'s memory, e.g. `[rows, 1]` for a `[rows]` vector.
 /// Borrows nothing: it must not outlive the tensor it was made from.
 pub(crate) struct DeviceTensorView {

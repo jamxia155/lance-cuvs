@@ -37,6 +37,10 @@ struct Args {
     /// 0 lets cuVS resolve it (itopk / search_width + graph hops).
     max_iterations: Vec<usize>,
     graph_degrees: Vec<usize>,
+    /// IVF-flat over the centroids: lists and probes to sweep (empty: skip).
+    ivf_lists: Vec<usize>,
+    ivf_probes: Vec<usize>,
+    skip_cagra: bool,
     /// (M, ef_construction, heuristic): derive CAGRA build params with cuVS's
     /// `cuvsCagraIndexParamsFromHnswParams` instead of `--graph-degree`.
     hnsw: Option<(i32, i32, String)>,
@@ -67,6 +71,9 @@ fn parse_args() -> BenchResult<Args> {
         itopk: vec![32, 64, 128],
         max_iterations: vec![0],
         graph_degrees: vec![32],
+        ivf_lists: vec![],
+        ivf_probes: vec![1, 2, 4, 8, 16, 32],
+        skip_cagra: false,
         hnsw: None,
         max_queries: 0,
         algo: "auto".to_string(),
@@ -85,6 +92,9 @@ fn parse_args() -> BenchResult<Args> {
             "--batch" => args.batches = parse_list(&value()?)?,
             "--itopk" => args.itopk = parse_list(&value()?)?,
             "--max-iterations" => args.max_iterations = parse_list(&value()?)?,
+            "--ivf-lists" => args.ivf_lists = parse_list(&value()?)?,
+            "--ivf-probes" => args.ivf_probes = parse_list(&value()?)?,
+            "--skip-cagra" => args.skip_cagra = true,
             "--graph-degree" => args.graph_degrees = parse_list(&value()?)?,
             "--hnsw" => {
                 let v = value()?;
@@ -281,7 +291,13 @@ pub fn run() -> BenchResult<()> {
          (first batch excluded when there are several)"
     );
 
-    let degrees = if args.hnsw.is_some() { vec![0] } else { args.graph_degrees.clone() };
+    let degrees = if args.skip_cagra {
+        vec![]
+    } else if args.hnsw.is_some() {
+        vec![0]
+    } else {
+        args.graph_degrees.clone()
+    };
     for &graph_degree in &degrees {
         let mut params = ptr::null_mut();
         err(check_cuvs(
@@ -427,6 +443,91 @@ pub fn run() -> BenchResult<()> {
         }
         let _ = unsafe { cuvs_sys::cuvsCagraIndexDestroy(index) };
         let _ = unsafe { cuvs_sys::cuvsDatasetDestroy(dataset) };
+    }
+
+    for &lists in &args.ivf_lists {
+        let mut params = ptr::null_mut();
+        err(check_cuvs(
+            unsafe { cuvs_sys::cuvsIvfFlatIndexParamsCreate(&mut params) },
+            "create IVF-flat index params",
+        ))?;
+        unsafe {
+            (*params).metric = cuvs_sys::cuvsDistanceType::L2Expanded;
+            (*params).n_lists = lists as u32;
+            (*params).kmeans_n_iters = 20;
+            (*params).kmeans_trainset_fraction = 1.0;
+            (*params).add_data_on_build = true;
+        }
+        let mut index = ptr::null_mut();
+        err(check_cuvs(
+            unsafe { cuvs_sys::cuvsIvfFlatIndexCreate(&mut index) },
+            "create IVF-flat index",
+        ))?;
+        let build_start = Instant::now();
+        let build = check_cuvs(
+            unsafe { cuvs_sys::cuvsIvfFlatBuild(res.0, params, centroid_dev.as_mut_ptr(), index) },
+            "build IVF-flat index",
+        );
+        let _ = unsafe { cuvs_sys::cuvsIvfFlatIndexParamsDestroy(params) };
+        err(build)?;
+        err(res.sync_stream())?;
+        println!("ivf_flat build: n_lists={lists} build_s={:.3}", build_start.elapsed().as_secs_f64());
+
+        for &batch in &args.batches {
+            let batch = batch.min(n);
+            let mut buf = SearchBuffers::<i64>::new(&res, batch, dim)?;
+            let batches = Batches { queries: &queries, dim, batch };
+            for &probes in &args.ivf_probes {
+                let probes = probes.min(lists);
+                let mut sp = ptr::null_mut();
+                err(check_cuvs(
+                    unsafe { cuvs_sys::cuvsIvfFlatSearchParamsCreate(&mut sp) },
+                    "create IVF-flat search params",
+                ))?;
+                unsafe { (*sp).n_probes = probes as u32 };
+                let (mut search_s, mut timed_rows, mut agree) = (0.0, 0usize, 0usize);
+                for (i, (offset, chunk)) in batches.iter().enumerate() {
+                    let rows = buf.load(&res, chunk, dim)?;
+                    let start = Instant::now();
+                    err(check_cuvs(
+                        unsafe {
+                            cuvs_sys::cuvsIvfFlatSearch(
+                                res.0,
+                                sp,
+                                index,
+                                buf.queries.as_mut_ptr(),
+                                buf.neighbors.as_mut_ptr(),
+                                buf.distances.as_mut_ptr(),
+                                no_filter,
+                            )
+                        },
+                        "IVF-flat search",
+                    ))?;
+                    err(res.sync_stream())?;
+                    let elapsed = start.elapsed().as_secs_f64();
+                    if i >= args.warmup_batches.min(batches.rows().div_ceil(batch) - 1) {
+                        search_s += elapsed;
+                        timed_rows += rows;
+                    }
+                    let labels = read_back(&buf.neighbors, &res, rows)?;
+                    for r in 0..rows {
+                        if labels[r] as u32 == ref_labels[offset + r] {
+                            agree += 1;
+                        }
+                    }
+                }
+                let _ = unsafe { cuvs_sys::cuvsIvfFlatSearchParamsDestroy(sp) };
+                println!(
+                    "ivf_flat search: n_lists={lists} batch={batch} n_probes={probes} \
+                     probe_fraction={:.4} timed_rows={timed_rows} search_s={search_s:.3} \
+                     rows_per_s={:.0} label_agree={:.5}",
+                    probes as f64 / lists as f64,
+                    timed_rows as f64 / search_s.max(1e-9),
+                    agree as f64 / n as f64
+                );
+            }
+        }
+        let _ = unsafe { cuvs_sys::cuvsIvfFlatIndexDestroy(index) };
     }
     let _ = unsafe { cuvs_sys::cuvsBruteForceIndexDestroy(bf_index) };
     Ok(())

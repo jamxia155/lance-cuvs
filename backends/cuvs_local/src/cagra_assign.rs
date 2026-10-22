@@ -52,27 +52,18 @@ fn usize_from_env(name: &str) -> Result<Option<usize>> {
 }
 
 impl CagraAssignConfig {
-    /// `Ok(None)` unless `LANCE_CUVS_ASSIGN=cagra`.
-    pub(crate) fn from_env() -> Result<Option<Self>> {
-        match std::env::var("LANCE_CUVS_ASSIGN").ok().as_deref() {
-            None | Some("") | Some("default") | Some("exact") => return Ok(None),
-            Some("cagra") => {}
-            Some(other) => {
-                return Err(Error::invalid_input(format!(
-                    "invalid LANCE_CUVS_ASSIGN '{other}': expected 'cagra' or 'exact'"
-                )));
-            }
-        }
+    /// Reads the `LANCE_CUVS_CAGRA_*` settings; the caller has already chosen CAGRA.
+    pub(crate) fn from_env() -> Result<Self> {
         let graph_degree =
             usize_from_env("LANCE_CUVS_CAGRA_GRAPH_DEGREE")?.unwrap_or(DEFAULT_GRAPH_DEGREE);
-        Ok(Some(Self {
+        Ok(Self {
             graph_degree,
             intermediate_graph_degree: usize_from_env("LANCE_CUVS_CAGRA_INTERMEDIATE_DEGREE")?
                 .unwrap_or(graph_degree * 2),
             itopk_size: usize_from_env("LANCE_CUVS_CAGRA_ITOPK")?.unwrap_or(DEFAULT_ITOPK),
             max_queries: usize_from_env("LANCE_CUVS_CAGRA_MAX_QUERIES")?.unwrap_or(0),
             max_iterations: usize_from_env("LANCE_CUVS_CAGRA_MAX_ITERATIONS")?.unwrap_or(0),
-        }))
+        })
     }
 }
 

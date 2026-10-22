@@ -15,7 +15,9 @@ mod backend;
 #[doc(hidden)]
 pub mod cagra_bench;
 mod cagra_assign;
+mod coarse_assign;
 mod cuda;
+mod ivf_assign;
 #[cfg(feature = "python")]
 mod python;
 
