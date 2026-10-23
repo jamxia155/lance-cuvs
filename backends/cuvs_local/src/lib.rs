@@ -19,6 +19,7 @@ mod coarse_assign;
 mod cuda;
 mod grouped_assign;
 mod ivf_assign;
+mod page_pool;
 #[cfg(feature = "python")]
 mod python;
 

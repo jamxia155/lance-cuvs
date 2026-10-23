@@ -565,7 +565,7 @@ impl RegisteredHostBuffer {
             .ok_or_else(|| Error::io("registered host buffer alignment overflow"))?
             & !(page_size - 1);
         let inward_end = end & !(page_size - 1);
-        if inward_end <= inward_start {
+        if inward_end <= inward_start || crate::page_pool::contains(start, original_bytes) {
             return Ok(unregistered(original_bytes));
         }
         let ptr = inward_start as *mut c_void;
@@ -681,6 +681,15 @@ impl RegistrationCache {
         }
         let page_size = page_size()?;
         let start = slice.as_ptr() as usize;
+        if crate::page_pool::contains(start, bytes) {
+            // Already pinned by the page pool: nothing to register, copy it in one piece.
+            return Ok(CacheCover {
+                segments: vec![0..bytes],
+                new_registrations: 0,
+                new_bytes: 0,
+                failed_gaps: 0,
+            });
+        }
         let end = start
             .checked_add(bytes)
             .ok_or_else(|| Error::io("registration cache range overflow"))?;
@@ -844,6 +853,9 @@ pub(crate) struct PinnedHostBuffer<T> {
     len: usize,
     _marker: PhantomData<T>,
 }
+
+// SAFETY: the buffer owns its pinned allocation exclusively (same as the cuvs_26_02 backend).
+unsafe impl<T: Send> Send for PinnedHostBuffer<T> {}
 
 impl<T: Copy> PinnedHostBuffer<T> {
     pub(crate) fn try_new(len: usize) -> Result<Self> {
