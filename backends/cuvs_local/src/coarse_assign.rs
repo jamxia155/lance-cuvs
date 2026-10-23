@@ -3,12 +3,14 @@
 
 //! Approximate coarse assignment for the IVF_PQ transform, as an alternative
 //! to cuVS's exhaustive `top_1_nn`. Selected with `LANCE_CUVS_ASSIGN`:
-//! `cagra` ([`crate::cagra_assign`]), `ivf_flat` ([`crate::ivf_assign`]), or
+//! `cagra` ([`crate::cagra_assign`]), `ivf_flat` ([`crate::ivf_assign`]),
+//! `grouped` ([`crate::grouped_assign`]), or
 //! unset / `exact` for the default. The assigner runs once per batch slot,
 //! ahead of `cuvsIvfPqTransformWithLabels`.
 
 use crate::cagra_assign::{CagraAssignConfig, CagraAssigner};
 use crate::cuda::{DeviceTensor, Resources};
+use crate::grouped_assign::{GroupedAssignConfig, GroupedAssigner};
 use crate::ivf_assign::{IvfFlatAssignConfig, IvfFlatAssigner};
 use arrow_array::FixedSizeListArray;
 use lance_core::{Error, Result};
@@ -17,6 +19,7 @@ use lance_linalg::distance::DistanceType;
 pub(crate) enum CoarseAssigner {
     Cagra(CagraAssigner),
     IvfFlat(IvfFlatAssigner),
+    Grouped(GroupedAssigner),
 }
 
 /// Device scratch an assigner needs next to the slot's labels.
@@ -37,7 +40,7 @@ impl AssignScratch {
             distances: DeviceTensor::try_new(resources, &[max_rows, 1])?,
             neighbors_i64: match assigner {
                 CoarseAssigner::IvfFlat(_) => Some(DeviceTensor::try_new(resources, &[max_rows, 1])?),
-                CoarseAssigner::Cagra(_) => None,
+                CoarseAssigner::Cagra(_) | CoarseAssigner::Grouped(_) => None,
             },
         })
     }
@@ -78,8 +81,17 @@ impl CoarseAssigner {
                     &config,
                 )?)))
             }
+            Some("grouped") => {
+                let config = GroupedAssignConfig::from_env()?;
+                Ok(Some(Self::Grouped(GroupedAssigner::build(
+                    resources,
+                    centroids,
+                    metric_type,
+                    &config,
+                )?)))
+            }
             Some(other) => Err(Error::invalid_input(format!(
-                "invalid LANCE_CUVS_ASSIGN '{other}': expected 'cagra', 'ivf_flat' or 'exact'"
+                "invalid LANCE_CUVS_ASSIGN '{other}': expected 'cagra', 'ivf_flat', 'grouped' or 'exact'"
             ))),
         }
     }
@@ -106,6 +118,7 @@ impl CoarseAssigner {
                 labels,
                 rows,
             ),
+            (Self::Grouped(grouped), _) => grouped.assign(resources, queries, labels),
             (Self::IvfFlat(_), None) => Err(Error::io("IVF-flat assignment scratch is missing")),
         }
     }

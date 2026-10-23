@@ -17,6 +17,7 @@ pub mod cagra_bench;
 mod cagra_assign;
 mod coarse_assign;
 mod cuda;
+mod grouped_assign;
 mod ivf_assign;
 #[cfg(feature = "python")]
 mod python;
