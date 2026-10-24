@@ -1,12 +1,23 @@
-//! A fixed pool of pinned host memory handed to
-//! lance-io for its large `O_DIRECT` page-read buffers, so these ~32 MiB
-//! allocations do not go through the global allocator. Falls back to the heap
-//! when the pool is empty or a request does not fit a slot.
+//! Fixed pools of pinned host memory handed to Lance so that its large host buffers do not go
+//! through the global allocator. Each pool is one `cudaMallocHost` region cut into fixed-size
+//! slots; a request takes one whole slot, and falls back to the heap when the pool is empty or
+//! the request does not fit a slot.
 //!
-//! `LANCE_CUVS_PAGE_POOL_GIB` (unset/0 = off), `LANCE_CUVS_PAGE_SLOT_MIB` (default 40).
+//! * page pool: the ~32 MiB `O_DIRECT` page-read buffers of lance-io.
+//!   `LANCE_CUVS_PAGE_POOL_GIB` (unset/0 = off), `LANCE_CUVS_PAGE_SLOT_MIB` (default 40).
+//! * batch pool: the contiguous buffer a decoded batch is assembled into from its pages
+//!   (lance-encoding), the buffer that is later copied to the device. Slots must hold a whole
+//!   batch (`batch_size` rows x dim x 4 bytes, 1 GiB for 128K rows of 2048 floats), and the pool
+//!   must cover every batch alive at once. `LANCE_CUVS_BATCH_POOL_GIB` (unset/0 = off),
+//!   `LANCE_CUVS_BATCH_SLOT_MIB` (default 1024).
+//!
+//! Slices inside either pool are already page-locked, see [`contains`].
 
 use crate::cuda::PinnedHostBuffer;
 use lance_core::Result;
+use lance_encoding::output_pool::{
+    DecodeOutputAllocator, OutputBuf, set_decode_output_allocator,
+};
 use lance_io::buffer_pool::{DirectBufAllocator, PoolBuf, set_direct_buf_allocator};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -14,20 +25,26 @@ use std::sync::{Arc, Mutex};
 
 const ALIGN: usize = 4096;
 
-/// Address range of the active pool's slots (`[start, end)`), or empty when there is none.
-static POOL_START: AtomicUsize = AtomicUsize::new(0);
-static POOL_END: AtomicUsize = AtomicUsize::new(0);
+/// Address ranges (`[start, end)`) of the active pools, one entry per pool kind; empty when off.
+static POOL_RANGES: [(AtomicUsize, AtomicUsize); 2] = [
+    (AtomicUsize::new(0), AtomicUsize::new(0)),
+    (AtomicUsize::new(0), AtomicUsize::new(0)),
+];
 
-/// True if `[ptr, ptr + len)` lies inside the pool's pinned region. Such memory is already
+/// True if `[ptr, ptr + len)` lies inside a pool's pinned region. Such memory is already
 /// page-locked, so it must not be passed to `cudaHostRegister` (which fails with
 /// `cudaErrorHostMemoryAlreadyRegistered`) and can be copied to the device directly.
 pub(crate) fn contains(ptr: usize, len: usize) -> bool {
-    let end = POOL_END.load(Ordering::Acquire);
-    let start = POOL_START.load(Ordering::Acquire);
-    ptr >= start && ptr.saturating_add(len) <= end
+    POOL_RANGES.iter().any(|(start, end)| {
+        let end = end.load(Ordering::Acquire);
+        let start = start.load(Ordering::Acquire);
+        ptr >= start && ptr.saturating_add(len) <= end
+    })
 }
 
-pub(crate) struct PagePool {
+pub(crate) struct SlotPool {
+    label: &'static str,
+    range_index: usize,
     // Owns the pinned region; only touched on drop.
     _region: Mutex<PinnedHostBuffer<u8>>,
     base: usize,
@@ -42,72 +59,113 @@ pub(crate) struct PagePool {
     max_in_use: AtomicUsize,
 }
 
-struct PoolHandle(Arc<PagePool>);
-
-impl DirectBufAllocator for PoolHandle {
-    fn alloc(&self, len: usize) -> Option<PoolBuf> {
-        let pool = &self.0;
-        pool.max_len.fetch_max(len, Ordering::Relaxed);
-        if len > pool.slot_bytes {
-            pool.misses_too_big.fetch_add(1, Ordering::Relaxed);
+impl SlotPool {
+    /// Takes one slot for a request of `len` bytes, with the closure that returns it.
+    fn take(self: &Arc<Self>, len: usize) -> Option<(NonNull<u8>, Box<dyn FnOnce() + Send + Sync>)> {
+        self.max_len.fetch_max(len, Ordering::Relaxed);
+        if len > self.slot_bytes {
+            self.misses_too_big.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let idx = pool.free.lock().expect("page pool poisoned").pop();
+        let idx = self.free.lock().expect("slot pool poisoned").pop();
         let Some(idx) = idx else {
-            pool.misses_empty.fetch_add(1, Ordering::Relaxed);
+            self.misses_empty.fetch_add(1, Ordering::Relaxed);
             return None;
         };
-        pool.hits.fetch_add(1, Ordering::Relaxed);
-        let now = pool.in_use.fetch_add(1, Ordering::Relaxed) + 1;
-        pool.max_in_use.fetch_max(now, Ordering::Relaxed);
-        let ptr = NonNull::new((pool.base + idx * pool.slot_bytes) as *mut u8)?;
-        let pool = pool.clone();
-        Some(PoolBuf {
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        let now = self.in_use.fetch_add(1, Ordering::Relaxed) + 1;
+        self.max_in_use.fetch_max(now, Ordering::Relaxed);
+        let ptr = NonNull::new((self.base + idx * self.slot_bytes) as *mut u8)?;
+        let pool = self.clone();
+        Some((
             ptr,
-            release: Box::new(move || {
+            Box::new(move || {
                 pool.in_use.fetch_sub(1, Ordering::Relaxed);
-                pool.free.lock().expect("page pool poisoned").push(idx);
+                pool.free.lock().expect("slot pool poisoned").push(idx);
             }),
-        })
+        ))
+    }
+
+    fn report(&self) {
+        eprintln!(
+            "cuVS {} pool: slots={} slot_mib={} hits={} misses_empty={} misses_too_big={} max_in_use={} max_request_mib={:.2}",
+            self.label,
+            self.slots,
+            self.slot_bytes >> 20,
+            self.hits.load(Ordering::Relaxed),
+            self.misses_empty.load(Ordering::Relaxed),
+            self.misses_too_big.load(Ordering::Relaxed),
+            self.max_in_use.load(Ordering::Relaxed),
+            self.max_len.load(Ordering::Relaxed) as f64 / (1u64 << 20) as f64,
+        );
+    }
+
+    fn clear_range(&self) {
+        let (start, end) = &POOL_RANGES[self.range_index];
+        end.store(0, Ordering::Release);
+        start.store(0, Ordering::Release);
     }
 }
 
-/// Registers the pool with lance-io for its lifetime; unregisters on drop.
+struct PageHandle(Arc<SlotPool>);
+
+impl DirectBufAllocator for PageHandle {
+    fn alloc(&self, len: usize) -> Option<PoolBuf> {
+        let (ptr, release) = self.0.take(len)?;
+        Some(PoolBuf { ptr, release })
+    }
+}
+
+struct BatchHandle(Arc<SlotPool>);
+
+impl DecodeOutputAllocator for BatchHandle {
+    fn alloc(&self, len: usize) -> Option<OutputBuf> {
+        let (ptr, release) = self.0.take(len)?;
+        Some(OutputBuf { ptr, release })
+    }
+}
+
+/// Registers the pools with lance-io / lance-encoding for their lifetime; unregisters on drop.
 pub(crate) struct PagePoolGuard {
-    pool: Arc<PagePool>,
+    page: Option<Arc<SlotPool>>,
+    batch: Option<Arc<SlotPool>>,
 }
 
 impl Drop for PagePoolGuard {
     fn drop(&mut self) {
-        set_direct_buf_allocator(None);
-        POOL_END.store(0, Ordering::Release);
-        POOL_START.store(0, Ordering::Release);
-        let p = &self.pool;
-        eprintln!(
-            "cuVS page pool: slots={} slot_mib={} hits={} misses_empty={} misses_too_big={} max_in_use={} max_request_mib={:.2}",
-            p.slots,
-            p.slot_bytes >> 20,
-            p.hits.load(Ordering::Relaxed),
-            p.misses_empty.load(Ordering::Relaxed),
-            p.misses_too_big.load(Ordering::Relaxed),
-            p.max_in_use.load(Ordering::Relaxed),
-            p.max_len.load(Ordering::Relaxed) as f64 / (1u64 << 20) as f64,
-        );
+        if let Some(pool) = &self.page {
+            set_direct_buf_allocator(None);
+            pool.clear_range();
+            pool.report();
+        }
+        if let Some(pool) = &self.batch {
+            set_decode_output_allocator(None);
+            pool.clear_range();
+            pool.report();
+        }
     }
 }
 
-pub(crate) fn page_pool_from_env() -> Result<Option<PagePoolGuard>> {
-    let gib: f64 = std::env::var("LANCE_CUVS_PAGE_POOL_GIB")
+fn env_f64(name: &str) -> f64 {
+    std::env::var(name)
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0);
-    if !(gib > 0.0) {
-        return Ok(None);
-    }
-    let slot_mib: usize = std::env::var("LANCE_CUVS_PAGE_SLOT_MIB")
+        .unwrap_or(0.0)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(40);
+        .unwrap_or(default)
+}
+
+fn create_pool(
+    label: &'static str,
+    range_index: usize,
+    gib: f64,
+    slot_mib: usize,
+) -> Result<Arc<SlotPool>> {
     let slot_bytes = (slot_mib << 20).div_ceil(ALIGN) * ALIGN;
     let slots = ((gib * (1u64 << 30) as f64) as usize / slot_bytes).max(1);
     let start = std::time::Instant::now();
@@ -115,7 +173,9 @@ pub(crate) fn page_pool_from_env() -> Result<Option<PagePoolGuard>> {
     let mut region = PinnedHostBuffer::<u8>::try_new(slots * slot_bytes + ALIGN)?;
     let raw = region.as_mut_slice().as_mut_ptr() as usize;
     let base = raw.div_ceil(ALIGN) * ALIGN;
-    let pool = Arc::new(PagePool {
+    let pool = Arc::new(SlotPool {
+        label,
+        range_index,
         _region: Mutex::new(region),
         base,
         slot_bytes,
@@ -128,15 +188,45 @@ pub(crate) fn page_pool_from_env() -> Result<Option<PagePoolGuard>> {
         in_use: AtomicUsize::new(0),
         max_in_use: AtomicUsize::new(0),
     });
-    POOL_START.store(base, Ordering::Release);
-    POOL_END.store(base + slots * slot_bytes, Ordering::Release);
-    set_direct_buf_allocator(Some(Arc::new(PoolHandle(pool.clone()))));
+    let (range_start, range_end) = &POOL_RANGES[range_index];
+    range_start.store(base, Ordering::Release);
+    range_end.store(base + slots * slot_bytes, Ordering::Release);
     eprintln!(
-        "cuVS page pool: enabled, {} x {} MiB pinned = {:.1} GiB (alloc {:.1}s)",
+        "cuVS {label} pool: enabled, {} x {} MiB pinned = {:.1} GiB (alloc {:.1}s)",
         slots,
         slot_bytes >> 20,
         (slots * slot_bytes) as f64 / (1u64 << 30) as f64,
         start.elapsed().as_secs_f64()
     );
-    Ok(Some(PagePoolGuard { pool }))
+    Ok(pool)
+}
+
+pub(crate) fn page_pool_from_env() -> Result<Option<PagePoolGuard>> {
+    let page_gib = env_f64("LANCE_CUVS_PAGE_POOL_GIB");
+    let batch_gib = env_f64("LANCE_CUVS_BATCH_POOL_GIB");
+    let mut guard = PagePoolGuard {
+        page: None,
+        batch: None,
+    };
+    if page_gib > 0.0 {
+        let pool = create_pool(
+            "page",
+            0,
+            page_gib,
+            env_usize("LANCE_CUVS_PAGE_SLOT_MIB", 40),
+        )?;
+        set_direct_buf_allocator(Some(Arc::new(PageHandle(pool.clone()))));
+        guard.page = Some(pool);
+    }
+    if batch_gib > 0.0 {
+        let pool = create_pool(
+            "batch",
+            1,
+            batch_gib,
+            env_usize("LANCE_CUVS_BATCH_SLOT_MIB", 1024),
+        )?;
+        set_decode_output_allocator(Some(Arc::new(BatchHandle(pool.clone()))));
+        guard.batch = Some(pool);
+    }
+    Ok((guard.page.is_some() || guard.batch.is_some()).then_some(guard))
 }
